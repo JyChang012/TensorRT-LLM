@@ -442,6 +442,16 @@ class PyTorchModelEngine(ModelEngine):
         self.lora_model_config: Optional[LoraModelConfig] = None
         self.cuda_graph_dummy_request = None
 
+        # Cache for LoRA params to reduce Python allocations across steps.
+        # Structure: {layer_id: {module_id: {"adapter_size": Tensor[int32],
+        #                                   "is_dora": Tensor[bool],
+        #                                   "weight_pointers": Tensor[int64]}}}
+        # Dynamic per-step fields like 'host_request_types', 'prompt_lens_cpu', and
+        # 'num_seqs' are set on this dict each iteration.
+        self._lora_params_cache = None
+        # Set of tuples (layer_id, module_id) describing the cached structure
+        self._lora_params_structure = None
+
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
         if self.use_beam_search:
@@ -1996,104 +2006,139 @@ class PyTorchModelEngine(ModelEngine):
             }
         }
         '''
-        lora_params = {}
-        tmp_lora_params = {}
-
         request_list = scheduled_requests.context_requests + scheduled_requests.generation_requests
 
-        # trace all requests to get the union set of the lora params
-        for request in request_list:
-            if request.py_lora_task_layer_module_configs is None:
+        # print(f'enter _get_lora_params_from_requests with ctx requests: {len(scheduled_requests.context_requests)} and gen requests: {len(scheduled_requests.generation_requests)}')
+
+        # Fast path: if no requests have LoRA, return empty dict to skip LoRA op entirely
+        first_with_lora = None
+        for req in request_list:
+            if req.py_lora_task_layer_module_configs is not None:
+                first_with_lora = req
+                break
+                # We still continue scanning to set has_any_lora quickly but avoid extra allocations
+        if first_with_lora is None:
+            return {}
+
+        
+
+        # Number of requests in current step (matches the construction order used by attention metadata)
+        num_reqs = len(request_list)
+
+        # Lazily build the cache structure on the first LoRA-enabled batch.
+        # We assume all LoRA requests share the same (layer_id, module_id) set.
+        if self._lora_params_cache is None:
+            # print('build lora_params_cache')
+            assert first_with_lora is not None
+            structure = set()
+            for module in first_with_lora.py_lora_task_layer_module_configs:
+                structure.add((module.layer_id, module.module_id))
+            
+            # print(f'finish building structure pairs: size: {len(structure)}')
+
+            # Allocate reusable tensors sized to the maximum possible sequences per step
+            max_num_seqs = num_reqs
+            cache = {}
+            for layer_id, module_id in structure:
+                if layer_id not in cache:
+                    cache[layer_id] = {}
+                cache[layer_id][module_id] = {
+                    'adapter_size': torch.empty((max_num_seqs, ), dtype=torch.int32),
+                    'is_dora': torch.empty((max_num_seqs, ), dtype=torch.bool),
+                    'weight_pointers': torch.empty((max_num_seqs * 3, ), dtype=torch.long),
+                }
+                # assert isinstance(cache[layer_id][module_id], dict), f"check 0: cache[layer_id={layer_id}][module_id={module_id}] is not a dict, but type: {type(cache[layer_id][module_id])}, value: {cache[layer_id][module_id]}"
+
+            # for layer_id in cache:
+            #     assert isinstance(cache[layer_id], dict), f"check 1: lora_params[layer_id={layer_id}] is not a dict, but type: {type(cache[layer_id])}, value: {cache[layer_id]}"
+            #     module_dict = cache[layer_id]
+            #     for module_id in module_dict:
+            #         assert isinstance(module_dict[module_id], dict), f"check 1: lora_params[layer_id={layer_id}][module_id={module_id}] is not a dict, but type: {type(module_dict[module_id])}, value: {module_dict[module_id]}"
+
+            self._lora_params_cache = cache
+            self._lora_params_structure = structure
+        else:
+            del self._lora_params_cache['host_request_types']
+            del self._lora_params_cache['prompt_lens_cpu']
+            del self._lora_params_cache['num_seqs']
+
+        lora_params = self._lora_params_cache
+
+        # for layer_id in lora_params:
+        #     assert isinstance(lora_params[layer_id], dict), f"check 2: lora_params[layer_id={layer_id}] is not a dict, but type: {type(lora_params[layer_id])}, value: {lora_params[layer_id]}"
+        #     module_dict = lora_params[layer_id]
+        #     for module_id in module_dict:
+        #         assert isinstance(module_dict[module_id], dict), f"check 2: lora_params[layer_id={layer_id}][module_id={module_id}] is not a dict, but type: {type(module_dict[module_id])}, value: {module_dict[module_id]}"
+
+
+        # Initialize to default values for current step without reallocations
+        # print(f'start resizing lora_params tensors')
+        for layer_id, module_dict in lora_params.items():
+            for module_id, module_entry in module_dict.items():
+                # assert isinstance(module_entry, dict), f"lora_params[layer_id={layer_id}][module_id={module_id}] is not a dict, but type: {type(module_entry)}, value: {module_entry}"
+                # assert 'adapter_size' in module_entry, f"adapter_size not in lora_params[layer_id={layer_id}][module_id={module_id}]"
+                # assert 'is_dora' in module_entry, f"is_dora not in lora_params[layer_id={layer_id}][module_id={module_id}]"
+                # assert 'weight_pointers' in module_entry, f"weight_pointers not in lora_params[layer_id={layer_id}][module_id={module_id}]"
+                # print(f"adapter_size type: {type(lora_params[layer_id][module_id]['adapter_size'])}")
+                # print(f"is_dora type: {type(lora_params[layer_id][module_id]['is_dora'])}")
+                # print(f"weight_pointers type: {type(lora_params[layer_id][module_id]['weight_pointers'])}")
+                # print(f"adapter_size shape: {lora_params[layer_id][module_id]['adapter_size'].shape}")
+                # print(f"is_dora shape: {lora_params[layer_id][module_id]['is_dora'].shape}")
+                # print(f"weight_pointers shape: {lora_params[layer_id][module_id]['weight_pointers'].shape}")
+                
+                buf_rank = module_entry['adapter_size']
+                buf_is_dora = module_entry['is_dora']
+                buf_ptrs = module_entry['weight_pointers']
+
+                # Resize to match current number of requests without allocating new storages
+                buf_rank.resize_(num_reqs)
+                buf_is_dora.resize_(num_reqs)
+                buf_ptrs.resize_(num_reqs * 3)
+
+                # Fill only the first num_reqs entries
+                buf_rank[:num_reqs].zero_()
+                buf_is_dora[:num_reqs].fill_(False)
+                buf_ptrs[:num_reqs * 3].zero_()
+        # print(f'finish resizing lora_params tensors')
+
+        # Populate buffers for requests that have LoRA configs
+        # print(f'start populating lora_params for requests')
+        for req_idx, req in enumerate(request_list):
+            # print(f'enter populating lora_params for request idx: {req_idx}')
+            modules = req.py_lora_task_layer_module_configs
+            if modules is None:
                 continue
+            for module in modules:
+                # print(f'enter populating lora_params for request idx: {req_idx} and module id: {module.module_id}; layer id: {module.layer_id}')
+                key = (module.layer_id, module.module_id)
+                # Skip modules not present in the cached structure (should not happen under the assumption)
+                if self._lora_params_structure is not None and key not in self._lora_params_structure:
+                    continue    # TODO: assert here
+                entry = lora_params[module.layer_id][module.module_id]
 
-            for module in request.py_lora_task_layer_module_configs:
-                module_id = module.module_id
-                layer_id = module.layer_id
-                adapter_size = module.adapter_size
-                is_dora = module.scaling_vec_pointer == 0
-                weights_in_pointer = module.weights_in_pointer
-                weights_out_pointer = module.weights_out_pointer
-                scaling_vec_pointer = module.scaling_vec_pointer
-                if weights_in_pointer is None:
-                    weights_in_pointer = 0
-                if weights_out_pointer is None:
-                    weights_out_pointer = 0
-                if scaling_vec_pointer is None:
-                    scaling_vec_pointer = 0
+                # Adapter size and DoRA flag
+                entry['adapter_size'][req_idx] = int(module.adapter_size)
+                entry['is_dora'][req_idx] = (module.scaling_vec_pointer == 0)
 
-                if layer_id not in lora_params:
-                    lora_params[layer_id] = {}
-                if module_id not in lora_params[layer_id]:
-                    lora_params[layer_id][module_id] = {}
+                # Weight pointers (three per request: A, B, optional DoRA magnitude)
+                base = req_idx * 3
+                weights_in_pointer = module.weights_in_pointer if module.weights_in_pointer is not None else 0
+                weights_out_pointer = module.weights_out_pointer if module.weights_out_pointer is not None else 0
+                scaling_vec_pointer = module.scaling_vec_pointer if module.scaling_vec_pointer is not None else 0
+                entry['weight_pointers'][base] = int(weights_in_pointer)
+                entry['weight_pointers'][base + 1] = int(weights_out_pointer)
+                entry['weight_pointers'][base + 2] = int(scaling_vec_pointer)
+                # print(f'finish populating lora_params for request idx: {req_idx} and module id: {module.module_id}; layer id: {module.layer_id}')
 
-                if 'adapter_size' not in lora_params[layer_id][module_id]:
-                    lora_params[layer_id][module_id]['adapter_size'] = []
-                if 'is_dora' not in lora_params[layer_id][module_id]:
-                    lora_params[layer_id][module_id]['is_dora'] = []
-                if 'weight_pointers' not in lora_params[layer_id][module_id]:
-                    lora_params[layer_id][module_id]['weight_pointers'] = []
+            # print(f'finish populating lora_params for request idx: {req_idx}')
+        # print(f'finish populating lora_params for requests')
 
-                tmp_lora_params[
-                    f'{request.py_request_id}_{layer_id}_{module_id}_adapter_size'] = [
-                        adapter_size
-                    ]
-                tmp_lora_params[
-                    f'{request.py_request_id}_{layer_id}_{module_id}_is_dora'] = [
-                        is_dora
-                    ]
-                tmp_lora_params[
-                    f'{request.py_request_id}_{layer_id}_{module_id}_weights_pointer'] = [
-                        weights_in_pointer, weights_out_pointer,
-                        scaling_vec_pointer
-                    ]
+        # Attach per-step metadata
+        lora_params['host_request_types'] = attn_metadata.host_request_types
+        lora_params['prompt_lens_cpu'] = attn_metadata.prompt_lens_cpu
+        lora_params['num_seqs'] = attn_metadata.num_seqs
 
-        for request in request_list:
-            # Need to set default values for this case
-            if request.py_lora_task_layer_module_configs is None:
-                for layer_id in lora_params:
-                    for module_id in lora_params[layer_id]:
-                        lora_params[layer_id][module_id]['adapter_size'].append(
-                            0)
-                        lora_params[layer_id][module_id]['is_dora'].append(
-                            False)
-                        lora_params[layer_id][module_id]['weight_pointers'] += [
-                            0, 0, 0
-                        ]
-
-            else:
-                for layer_id in lora_params:
-                    for module_id in lora_params[layer_id]:
-                        if f'{request.py_request_id}_{layer_id}_{module_id}_adapter_size' not in tmp_lora_params:
-                            lora_params[layer_id][module_id][
-                                'adapter_size'].append(0)
-                            lora_params[layer_id][module_id]['is_dora'].append(
-                                False)
-                            lora_params[layer_id][module_id][
-                                'weight_pointers'] += [0, 0, 0]
-                        else:
-                            lora_params[layer_id][module_id][
-                                'adapter_size'] += tmp_lora_params[
-                                    f'{request.py_request_id}_{layer_id}_{module_id}_adapter_size']
-                            lora_params[layer_id][module_id][
-                                'is_dora'] += tmp_lora_params[
-                                    f'{request.py_request_id}_{layer_id}_{module_id}_is_dora']
-                            lora_params[layer_id][module_id][
-                                'weight_pointers'] += tmp_lora_params[
-                                    f'{request.py_request_id}_{layer_id}_{module_id}_weights_pointer']
-
-        for layer_id in lora_params:
-            for module_id in lora_params[layer_id]:
-                lora_params[layer_id][module_id][
-                    'adapter_size'] = torch.IntTensor(
-                        lora_params[layer_id][module_id]['adapter_size'])
-                lora_params[layer_id][module_id][
-                    'weight_pointers'] = torch.LongTensor(
-                        lora_params[layer_id][module_id]['weight_pointers'])
-
-        if bool(lora_params):
-            lora_params['host_request_types'] = attn_metadata.host_request_types
-            lora_params['prompt_lens_cpu'] = attn_metadata.prompt_lens_cpu
-            lora_params['num_seqs'] = attn_metadata.num_seqs
+        # print(f'finish _get_lora_params_from_requests with lora_params, returning')
 
         return lora_params
 
