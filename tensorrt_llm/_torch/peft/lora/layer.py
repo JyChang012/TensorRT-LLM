@@ -99,6 +99,7 @@ class LoraLayer(torch.nn.Module):
         layer_idx: int,
     ) -> Optional[torch.Tensor]:
 
+        # torch.cuda.cudart().cudaProfilerStart()
         if bool(lora_params):
             lora_ranks = []
             lora_weight_pointers = []
@@ -117,6 +118,7 @@ class LoraLayer(torch.nn.Module):
             num_seqs = lora_params['num_seqs']
 
             if len(active_lora_module_ids) == 0:
+                # torch.cuda.cudart().cudaProfilerStop()
                 return None
             else:
                 lora_outputs = torch.ops.trtllm.lora_grouped_gemm(
@@ -133,6 +135,7 @@ class LoraLayer(torch.nn.Module):
                     True,  # TODO smor- should be lora_params["remove_input_padding"], support in loraOp as well
                 )
                 if isinstance(lora_outputs, torch.Tensor):
+                    # torch.cuda.cudart().cudaProfilerStop()
                     return lora_outputs
                 else:
                     # For multiple LoRA modules, some might not be executed in grouped gemm.
@@ -152,7 +155,9 @@ class LoraLayer(torch.nn.Module):
                                             dtype=x.dtype,
                                             device=x.device))
                     lora_output = torch.cat(lora_output, dim=-1)
+                    # torch.cuda.cudart().cudaProfilerStop()
                     return lora_output
 
         else:
+            # torch.cuda.cudart().cudaProfilerStop()
             return None
