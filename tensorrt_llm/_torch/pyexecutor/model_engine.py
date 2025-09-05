@@ -58,6 +58,7 @@ from ..utils import (get_model_extra_attrs,
                      set_torch_compiling, with_model_extra_attrs)
 from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
+from .cuda_graph_lora_manager import CudaGraphLoraManager
 from .cuda_graph_runner import CUDAGraphRunner
 from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
@@ -458,6 +459,11 @@ class PyTorchModelEngine(ModelEngine):
         self.lora_model_config: Optional[LoraModelConfig] = None
         self.cuda_graph_runner = CUDAGraphRunner(self)
 
+        # Initialize CUDA Graph LoRA manager if LoRA is enabled
+        self.cuda_graph_lora_manager: Optional[CudaGraphLoraManager] = None
+        if lora_config is not None and pytorch_backend_config.use_cuda_graph:
+            self._init_cuda_graph_lora_manager(lora_config)
+
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
         if self.use_beam_search:
@@ -483,6 +489,60 @@ class PyTorchModelEngine(ModelEngine):
             hidden_size=self.model.config.hidden_size,
             dtype=torch_dtype_to_str(self.model.config.torch_dtype),
             swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight)
+
+    def _init_cuda_graph_lora_manager(self, lora_config: LoraConfig):
+        """Initialize CUDA Graph LoRA manager with model configuration."""
+        try:
+            # Get model configuration
+            model_config = self.model.config
+            num_layers = model_config.num_hidden_layers
+            max_lora_size = lora_config.max_loras or 8  # Default fallback
+
+            # Calculate layer module numbers based on target modules
+            # This is a simplified version - in practice, this should be computed
+            # based on the actual model architecture and target modules
+            num_attention_modules = 0
+            num_mlp_modules = 0
+
+            for module in lora_config.lora_target_modules:
+                if 'attention' in module.lower() or any(
+                        x in module.lower() for x in ['q', 'k', 'v', 'qkv']):
+                    num_attention_modules += 1
+                elif any(x in module.lower()
+                         for x in ['mlp', 'gate', 'up', 'down']):
+                    num_mlp_modules += 1
+
+            # Assume uniform layer structure for simplicity
+            layer_module_nums = [max(num_attention_modules, num_mlp_modules)
+                                 ] * num_layers
+
+            # Set reasonable defaults for max ranks and output sizes
+            hidden_size = model_config.hidden_size
+            max_ranks = [lora_config.max_lora_rank] * num_layers
+
+            # Output sizes depend on the modules - simplified estimation
+            output_sizes = []
+            for layer_idx in range(num_layers):
+                layer_output_sizes = [hidden_size
+                                      ] * layer_module_nums[layer_idx]
+                output_sizes.append(layer_output_sizes)
+
+            self.cuda_graph_lora_manager = CudaGraphLoraManager(
+                num_layers=num_layers,
+                max_lora_size=max_lora_size,
+                layer_module_nums=layer_module_nums,
+                max_ranks=max_ranks,
+                output_sizes=output_sizes,
+                device='cuda')
+
+            logger.info(
+                f"Initialized CUDA Graph LoRA manager with {num_layers} layers, "
+                f"max {max_lora_size} adapters, max rank {lora_config.max_lora_rank}"
+            )
+
+        except Exception as e:
+            logger.warning(f"Failed to initialize CUDA Graph LoRA manager: {e}")
+            self.cuda_graph_lora_manager = None
 
     def set_guided_decoder(self,
                            guided_decoder: CapturableGuidedDecoder) -> bool:
@@ -2106,6 +2166,48 @@ class PyTorchModelEngine(ModelEngine):
                                        scheduled_requests: ScheduledRequests,
                                        attn_metadata: AttentionMetadata):
         '''
+        Get LoRA parameters from scheduled requests.
+
+        Uses CUDA Graph compatible mode if available, otherwise falls back to legacy mode.
+
+        Returns:
+            Dictionary containing LoRA parameters, or None if no LoRA requests
+        '''
+        # Check if we should use CUDA Graph mode
+        use_cuda_graph_mode = (self.cuda_graph_lora_manager is not None
+                               and self.pytorch_backend_config.use_cuda_graph)
+
+        if use_cuda_graph_mode:
+            # Get PEFT table from resource manager if available
+            try:
+                peft_cache_manager = getattr(self, '_peft_cache_manager', None)
+                if peft_cache_manager is None:
+                    # Fallback to legacy mode if PEFT cache manager not available
+                    return self._get_legacy_lora_params_from_requests(
+                        scheduled_requests, attn_metadata)
+
+                # Get PEFT table - this would need to be passed from the resource manager
+                # For now, using empty dict as placeholder - this needs proper integration
+                peft_table = {}
+
+                return self.cuda_graph_lora_manager.prepare_cuda_graph_lora_params(
+                    scheduled_requests, attn_metadata, peft_table)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to prepare CUDA Graph LoRA params, falling back to legacy mode: {e}"
+                )
+                return self._get_legacy_lora_params_from_requests(
+                    scheduled_requests, attn_metadata)
+        else:
+            return self._get_legacy_lora_params_from_requests(
+                scheduled_requests, attn_metadata)
+
+    def _get_legacy_lora_params_from_requests(
+            self, scheduled_requests: ScheduledRequests,
+            attn_metadata: AttentionMetadata):
+        '''
+        Legacy LoRA parameter preparation logic.
+
         lora_params: dict
         {
             layer_id: dict
