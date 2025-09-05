@@ -100,57 +100,154 @@ class LoraLayer(torch.nn.Module):
     ) -> Optional[torch.Tensor]:
 
         if bool(lora_params):
-            lora_ranks = []
-            lora_weight_pointers = []
-            active_lora_module_ids = []
-            for module_idx in self.lora_module_types:
-                module_idx = int(module_idx)
-                if module_idx in lora_params[layer_idx]:
-                    active_lora_module_ids.append(module_idx)
-                    lora_ranks.append(
-                        lora_params[layer_idx][module_idx]['adapter_size'])
-                    lora_weight_pointers.append(
-                        lora_params[layer_idx][module_idx]['weight_pointers'])
+            # Check if we're using CUDA Graph mode
+            use_cuda_graph_mode = lora_params.get('use_cuda_graph_mode', False)
 
-            num_seqs = lora_params['num_seqs']
-
-            if len(active_lora_module_ids) == 0:
-                return None
+            if use_cuda_graph_mode:
+                return self._forward_cuda_graph_mode(x, lora_params, layer_idx)
             else:
-                lora_outputs = torch.ops.trtllm.lora_grouped_gemm(
-                    x,
-                    lora_params['host_request_types'][:num_seqs],
-                    lora_ranks,
-                    lora_weight_pointers,
-                    lora_params['prompt_lens_cpu'][:num_seqs],
-                    self.output_hidden_sizes,
-                    False,  # transA
-                    True,  # transB
-                    max([r.max() for r in lora_ranks]),
-                    0,
-                    True,  # TODO smor- should be lora_params["remove_input_padding"], support in loraOp as well
-                )
-                if isinstance(lora_outputs, torch.Tensor):
-                    return lora_outputs
-                else:
-                    # For multiple LoRA modules, some might not be executed in grouped gemm.
-                    # For those modules not executed, we create zero tensors with matching dimensions.
-                    # Finally we concatenate all tensors (both LoRA outputs and zero tensors) in order.
-                    lora_output = []
-                    for module_idx in self.lora_module_types:
-                        if int(module_idx) in active_lora_module_ids:
-                            lora_output.append(lora_outputs.pop(0))
-                        else:
-                            lora_output.append(
-                                torch.zeros(list(x.shape[:-1]) + [
-                                    self.output_hidden_sizes[
-                                        self.lora_module_types.index(
-                                            module_idx)]
-                                ],
-                                            dtype=x.dtype,
-                                            device=x.device))
-                    lora_output = torch.cat(lora_output, dim=-1)
-                    return lora_output
-
+                return self._forward_legacy_mode(x, lora_params, layer_idx)
         else:
             return None
+
+    def _forward_cuda_graph_mode(
+        self,
+        x: torch.Tensor,
+        lora_params: Dict,
+        layer_idx: int,
+    ) -> Optional[torch.Tensor]:
+        """
+        Forward pass using CUDA Graph compatible LoRA parameters.
+
+        Args:
+            x: Input tensor
+            lora_params: CUDA Graph compatible LoRA parameters
+            layer_idx: Current layer index
+
+        Returns:
+            LoRA output tensor or None
+        """
+        cuda_graph_params = lora_params.get('cuda_graph_params')
+        if cuda_graph_params is None:
+            return None
+
+        # Get layer-specific parameters
+        layer_params = cuda_graph_params.get_layer_params(layer_idx)
+
+        # Use the new CUDA Graph compatible grouped GEMM operation
+        # This will be implemented as a new custom operator
+        try:
+            # Create intermediate buffers sized for LoRA operations only (no base model)
+            batch_size, hidden_size = x.shape[0], x.shape[-1]
+
+            # Intermediate buffer: only for LoRA tokens, not base model tokens
+            max_rank = max(
+                [layer_params.d_lora_in_sizes[:, :, 2].max().item(), 1])
+            intermediate_buffer_size = batch_size * max_rank  # Conservative estimate
+            intermediate_buffer = torch.zeros(intermediate_buffer_size,
+                                              dtype=x.dtype,
+                                              device=x.device)
+
+            # Output buffer: includes space for ALL tokens (LoRA + base model)
+            # Base model tokens will be handled by pass-through in reordering kernels
+            total_output_size = sum(self.output_hidden_sizes)
+            output_buffer = torch.zeros(batch_size,
+                                        total_output_size,
+                                        dtype=x.dtype,
+                                        device=x.device)
+
+            # Update buffer base addresses in layer params
+            layer_params.intermediate_buffer_base = intermediate_buffer
+            layer_params.output_buffer_base = output_buffer
+
+            # Call the new CUDA Graph compatible operator with sorted indices
+            lora_outputs = torch.ops.trtllm.lora_grouped_gemm_cuda_graph(
+                x,  # Input tensor
+                layer_params.d_lora_in_sizes,  # GEMM sizes for lora_in
+                layer_params.d_lora_out_sizes,  # GEMM sizes for lora_out
+                layer_params.d_a_offset,  # Input offsets
+                layer_params.d_b_ptrs,  # Lora_in weight pointers
+                layer_params.d_d_offset,  # Intermediate output offsets
+                layer_params.d_b_prime_ptrs,  # Lora_out weight pointers
+                layer_params.d_d_prime_offset,  # Final output offsets
+                cuda_graph_params.slot_ids,  # Slot IDs (for reference)
+                cuda_graph_params.
+                sorted_ids,  # Sorted indices for gather/scatter
+                cuda_graph_params.get_problem_count(
+                    layer_idx),  # Number of GEMM problems
+                intermediate_buffer,  # Intermediate buffer (LoRA only)
+                output_buffer,  # Output buffer (all tokens)
+            )
+            return lora_outputs
+        except AttributeError:
+            # Fallback to legacy mode if new operator is not available
+            return self._forward_legacy_mode(x, lora_params, layer_idx)
+
+    def _forward_legacy_mode(
+        self,
+        x: torch.Tensor,
+        lora_params: Dict,
+        layer_idx: int,
+    ) -> Optional[torch.Tensor]:
+        """
+        Legacy forward pass using the original LoRA implementation.
+
+        Args:
+            x: Input tensor
+            lora_params: Legacy LoRA parameters
+            layer_idx: Current layer index
+
+        Returns:
+            LoRA output tensor or None
+        """
+        lora_ranks = []
+        lora_weight_pointers = []
+        active_lora_module_ids = []
+
+        for module_idx in self.lora_module_types:
+            module_idx = int(module_idx)
+            if module_idx in lora_params[layer_idx]:
+                active_lora_module_ids.append(module_idx)
+                lora_ranks.append(
+                    lora_params[layer_idx][module_idx]['adapter_size'])
+                lora_weight_pointers.append(
+                    lora_params[layer_idx][module_idx]['weight_pointers'])
+
+        num_seqs = lora_params['num_seqs']
+
+        if len(active_lora_module_ids) == 0:
+            return None
+        else:
+            lora_outputs = torch.ops.trtllm.lora_grouped_gemm(
+                x,
+                lora_params['host_request_types'][:num_seqs],
+                lora_ranks,
+                lora_weight_pointers,
+                lora_params['prompt_lens_cpu'][:num_seqs],
+                self.output_hidden_sizes,
+                False,  # transA
+                True,  # transB
+                max([r.max() for r in lora_ranks]),
+                0,
+                True,  # TODO smor- should be lora_params["remove_input_padding"], support in loraOp as well
+            )
+            if isinstance(lora_outputs, torch.Tensor):
+                return lora_outputs
+            else:
+                # For multiple LoRA modules, some might not be executed in grouped gemm.
+                # For those modules not executed, we create zero tensors with matching dimensions.
+                # Finally we concatenate all tensors (both LoRA outputs and zero tensors) in order.
+                lora_output = []
+                for module_idx in self.lora_module_types:
+                    if int(module_idx) in active_lora_module_ids:
+                        lora_output.append(lora_outputs.pop(0))
+                    else:
+                        lora_output.append(
+                            torch.zeros(list(x.shape[:-1]) + [
+                                self.output_hidden_sizes[
+                                    self.lora_module_types.index(module_idx)]
+                            ],
+                                        dtype=x.dtype,
+                                        device=x.device))
+                lora_output = torch.cat(lora_output, dim=-1)
+                return lora_output

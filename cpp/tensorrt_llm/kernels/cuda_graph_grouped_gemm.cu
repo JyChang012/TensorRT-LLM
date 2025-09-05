@@ -1,0 +1,414 @@
+/*
+ * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "cuda_graph_grouped_gemm.h"
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+
+#include "cutlass/cutlass.h"
+#include "cutlass/gemm/device/gemm_grouped.h"
+#include "cutlass/gemm/kernel/default_gemm_grouped.h"
+#include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/device/splitk_gemm_grouped.h"
+#include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/default_splitk_gemm_grouped.h"
+
+namespace tensorrt_llm
+{
+namespace kernels
+{
+
+/**
+ * Compute leading dimensions on GPU for CUTLASS grouped GEMM
+ */
+__global__ void compute_leading_dimensions_kernel(cutlass::gemm::GemmCoord const* problem_sizes, int64_t* lda,
+    int64_t* ldb, int64_t* ldc, int64_t* ldd, int problem_count)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < problem_count)
+    {
+        auto problem = problem_sizes[idx];
+
+        // LayoutA = RowMajor, LayoutB = ColumnMajor, LayoutC/D = RowMajor
+        // Leading dimensions - stride in the slowest-changing dimension
+        lda[idx] = problem.k(); // For RowMajor A[M,K], leading dim is K
+        ldb[idx] = problem.k(); // For ColumnMajor B[K,N], leading dim is K
+        ldc[idx] = problem.n(); // For RowMajor C[M,N], leading dim is N
+        ldd[idx] = problem.n(); // For RowMajor D[M,N], leading dim is N
+    }
+}
+
+/**
+ * Template for CUDA Graph compatible grouped GEMM that directly uses GPU tensors
+ */
+template <int M1, int N1, int K1, int M2, int N2, int K2, typename cutlassType, int kAlignmentAB, int kAlignmentC,
+    int kStages>
+void cuda_graph_grouped_gemm_template(cutlass::gemm::GemmCoord const* problem_sizes_ptr, int problem_count,
+    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu,
+    void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, cudaStream_t stream)
+{
+    using ElementA = cutlassType;
+    using ElementB = cutlassType;
+    using ElementOutput = cutlassType;
+    using ElementAccumulator = float;
+
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+
+    using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<ElementA, LayoutA,
+        cutlass::ComplexTransform::kNone, kAlignmentAB, ElementB, LayoutB, cutlass::ComplexTransform::kNone,
+        kAlignmentAB, ElementOutput, LayoutC, ElementAccumulator, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<M1, N1, K1>, cutlass::gemm::GemmShape<M2, N2, K2>, cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<ElementOutput, kAlignmentC, ElementAccumulator,
+            ElementAccumulator>,
+        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle, kStages,
+        cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly>::GemmKernel;
+
+    using Gemm = cutlass::gemm::device::GemmGrouped<GemmKernel>;
+
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    typename Gemm::EpilogueOutputOp::Params epilogue_op(alpha, beta);
+
+    // Allocate temporary workspace for leading dimensions on GPU
+    auto ldd_size = tensorrt_llm::common::divUp(problem_count * sizeof(int64_t), 16) * 16;
+    size_t temp_workspace_size = 4 * ldd_size; // For lda, ldb, ldc, ldd
+
+    TLLM_CHECK_WITH_INFO(temp_workspace_size <= gemmExecutionWorkspaceSize,
+        "Insufficient workspace for leading dimensions. Required: %zu, Available: %ld", temp_workspace_size,
+        gemmExecutionWorkspaceSize);
+
+    char* workspace_ptr = static_cast<char*>(gemmExecutionWorkspace);
+    int64_t* lda = reinterpret_cast<int64_t*>(workspace_ptr);
+    int64_t* ldb = reinterpret_cast<int64_t*>(workspace_ptr + ldd_size);
+    int64_t* ldc = reinterpret_cast<int64_t*>(workspace_ptr + 2 * ldd_size);
+    int64_t* ldd = reinterpret_cast<int64_t*>(workspace_ptr + 3 * ldd_size);
+
+    // Compute leading dimensions on GPU using a kernel
+    int const blockSize = 256;
+    int const gridSize = (problem_count + blockSize - 1) / blockSize;
+
+    compute_leading_dimensions_kernel<<<gridSize, blockSize, 0, stream>>>(
+        problem_sizes_ptr, lda, ldb, ldc, ldd, problem_count);
+
+    // Cast pointers to the correct types for CUTLASS
+    auto** ptr_A = reinterpret_cast<ElementA* const*>(ptrA_gpu);
+    auto** ptr_B = reinterpret_cast<ElementB* const*>(ptrB_gpu);
+    auto** ptr_C = reinterpret_cast<ElementOutput* const*>(ptrC_gpu);
+    auto** ptr_D = reinterpret_cast<ElementOutput* const*>(ptrD_gpu);
+
+    // Get remaining workspace for GEMM execution (after leading dimensions)
+    void* gemm_workspace = workspace_ptr + temp_workspace_size;
+    size_t gemm_workspace_size = gemmExecutionWorkspaceSize - temp_workspace_size;
+
+    // Initialize the GEMM operator
+    Gemm gemm_op;
+
+    // Calculate threadblock count
+    int threadblock_count = Gemm::sufficient(problem_sizes_ptr, problem_count);
+
+    // Setup arguments for grouped GEMM - directly using GPU tensor pointers
+    typename Gemm::Arguments args(problem_sizes_ptr, // GPU problem sizes
+        problem_count,                               // Problem count
+        threadblock_count,                           // Threadblock count
+        epilogue_op,                                 // Epilogue operation
+        ptr_A,                                       // GPU pointer array A
+        ptr_B,                                       // GPU pointer array B
+        ptr_C,                                       // GPU pointer array C (can be nullptr)
+        ptr_D,                                       // GPU pointer array D
+        lda,                                         // Leading dimension A (on GPU)
+        ldb,                                         // Leading dimension B (on GPU)
+        ldc,                                         // Leading dimension C (on GPU)
+        ldd,                                         // Leading dimension D (on GPU)
+        problem_sizes_ptr                            // Problem sizes for host-side calculations
+    );
+
+    // Check if arguments are valid
+    TLLM_CHECK_WITH_INFO(gemm_op.can_implement(args), "Grouped GEMM cannot be implemented with the given arguments");
+
+    // Get workspace size required by GEMM
+    size_t required_workspace = gemm_op.get_workspace_size(args);
+    TLLM_CHECK_WITH_INFO(required_workspace <= gemm_workspace_size,
+        "Insufficient GEMM workspace. Required: %zu, Available: %zu", required_workspace, gemm_workspace_size);
+
+    // Initialize the GEMM operator
+    cutlass::Status status = gemm_op.initialize(args, gemm_workspace);
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "Failed to initialize grouped GEMM");
+
+    // Execute the GEMM
+    status = gemm_op.run(stream);
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "Failed to execute grouped GEMM");
+}
+
+void cuda_graph_grouped_gemm(cutlass::gemm::GemmCoord const* problem_sizes_ptr, int problem_count,
+    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu,
+    void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, bool isLoraIn, nvinfer1::DataType dataType,
+    int minKN, cudaStream_t stream)
+{
+    // Based on the original groupGemm.cu logic for kernel selection
+    if (dataType == nvinfer1::DataType::kHALF)
+    {
+        if (minKN >= 128 * 128)
+        {
+            cuda_graph_grouped_gemm_template<128, 128, 64, 128, 128, 64, cutlass::half_t, 8, 8, 4>(problem_sizes_ptr,
+                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, stream);
+        }
+        else if (minKN >= 64 * 64)
+        {
+            cuda_graph_grouped_gemm_template<64, 64, 64, 64, 64, 64, cutlass::half_t, 8, 8, 4>(problem_sizes_ptr,
+                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, stream);
+        }
+        else
+        {
+            cuda_graph_grouped_gemm_template<32, 32, 32, 32, 32, 32, cutlass::half_t, 8, 8, 4>(problem_sizes_ptr,
+                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, stream);
+        }
+    }
+    else if (dataType == nvinfer1::DataType::kBF16)
+    {
+        if (minKN >= 128 * 128)
+        {
+            cuda_graph_grouped_gemm_template<128, 128, 64, 128, 128, 64, cutlass::bfloat16_t, 8, 8, 4>(
+                problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, stream);
+        }
+        else if (minKN >= 64 * 64)
+        {
+            cuda_graph_grouped_gemm_template<64, 64, 64, 64, 64, 64, cutlass::bfloat16_t, 8, 8, 4>(problem_sizes_ptr,
+                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, stream);
+        }
+        else
+        {
+            cuda_graph_grouped_gemm_template<32, 32, 32, 32, 32, 32, cutlass::bfloat16_t, 8, 8, 4>(problem_sizes_ptr,
+                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, stream);
+        }
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(false, "Unsupported data type for CUDA Graph grouped GEMM");
+    }
+}
+
+/**
+ * Template for CUDA Graph compatible split-K grouped GEMM
+ */
+template <int M1, int N1, int K1, int M2, int N2, int K2, typename cutlassType, int kAlignmentAB, int kAlignmentC,
+    int kStages>
+void cuda_graph_splitk_grouped_gemm_template(cutlass::gemm::GemmCoord const* problem_sizes_ptr, int problem_count,
+    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu,
+    void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, int splitKSlices, cudaStream_t stream)
+{
+    using ElementA = cutlassType;
+    using ElementB = cutlassType;
+    using ElementOutput = cutlassType;
+    using ElementAccumulator = float;
+
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+
+    using GemmKernel = typename cutlass_extensions::gemm::kernel::DefaultSplitkGemmGrouped<ElementA, LayoutA,
+        cutlass::ComplexTransform::kNone, kAlignmentAB, ElementB, LayoutB, cutlass::ComplexTransform::kNone,
+        kAlignmentAB, ElementOutput, LayoutC, ElementAccumulator, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<M1, N1, K1>, cutlass::gemm::GemmShape<M2, N2, K2>, cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<ElementOutput, kAlignmentC, ElementAccumulator,
+            ElementAccumulator>,
+        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle, kStages>::GemmKernel;
+
+    using Gemm = cutlass_extensions::gemm::device::SplitkGemmGrouped<GemmKernel>;
+
+    float alpha = 1.0f;
+    float beta = 0.0f;
+
+    // Allocate temporary workspace for leading dimensions on GPU
+    auto ldd_size = tensorrt_llm::common::divUp(problem_count * sizeof(int64_t), 16) * 16;
+    size_t temp_workspace_size = 4 * ldd_size; // For lda, ldb, ldc, ldd
+
+    TLLM_CHECK_WITH_INFO(temp_workspace_size <= gemmExecutionWorkspaceSize,
+        "Insufficient workspace for leading dimensions. Required: %zu, Available: %ld", temp_workspace_size,
+        gemmExecutionWorkspaceSize);
+
+    char* workspace_ptr = static_cast<char*>(gemmExecutionWorkspace);
+    int64_t* lda = reinterpret_cast<int64_t*>(workspace_ptr);
+    int64_t* ldb = reinterpret_cast<int64_t*>(workspace_ptr + ldd_size);
+    int64_t* ldc = reinterpret_cast<int64_t*>(workspace_ptr + 2 * ldd_size);
+    int64_t* ldd = reinterpret_cast<int64_t*>(workspace_ptr + 3 * ldd_size);
+
+    // Compute leading dimensions on GPU
+    int const blockSize = 256;
+    int const gridSize = (problem_count + blockSize - 1) / blockSize;
+
+    compute_leading_dimensions_kernel<<<gridSize, blockSize, 0, stream>>>(
+        problem_sizes_ptr, lda, ldb, ldc, ldd, problem_count);
+
+    // Cast pointers to the correct types for CUTLASS
+    auto** ptr_A = reinterpret_cast<ElementA* const*>(ptrA_gpu);
+    auto** ptr_B = reinterpret_cast<ElementB* const*>(ptrB_gpu);
+    auto** ptr_C = reinterpret_cast<ElementOutput* const*>(ptrC_gpu);
+    auto** ptr_D = reinterpret_cast<ElementOutput* const*>(ptrD_gpu);
+
+    // Get remaining workspace for GEMM execution
+    void* gemm_workspace = workspace_ptr + temp_workspace_size;
+    size_t gemm_workspace_size = gemmExecutionWorkspaceSize - temp_workspace_size;
+
+    // Initialize the GEMM operator
+    Gemm gemm_op;
+
+    // Setup arguments for split-K grouped GEMM
+    typename Gemm::Arguments args(problem_count, // Problem count
+        ptr_A,                                   // GPU pointer array A
+        ptr_B,                                   // GPU pointer array B
+        ptr_C,                                   // GPU pointer array C
+        ptr_D,                                   // GPU pointer array D
+        lda,                                     // Leading dimension A (on GPU)
+        ldb,                                     // Leading dimension B (on GPU)
+        ldc,                                     // Leading dimension C (on GPU)
+        ldd,                                     // Leading dimension D (on GPU)
+        problem_sizes_ptr,                       // GPU problem sizes
+        splitKSlices,                            // Split-K factor
+        alpha,                                   // Alpha scaling factor
+        beta                                     // Beta scaling factor
+    );
+
+    // Check if arguments are valid
+    TLLM_CHECK_WITH_INFO(
+        gemm_op.can_implement(args), "Split-K grouped GEMM cannot be implemented with the given arguments");
+
+    // Get workspace size required by GEMM
+    size_t required_workspace = gemm_op.get_workspace_size(args);
+    TLLM_CHECK_WITH_INFO(required_workspace <= gemm_workspace_size,
+        "Insufficient split-K GEMM workspace. Required: %zu, Available: %zu", required_workspace, gemm_workspace_size);
+
+    // Initialize the GEMM operator
+    cutlass::Status status = gemm_op.initialize(args, gemm_workspace);
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "Failed to initialize split-K grouped GEMM");
+
+    // Execute the GEMM
+    status = gemm_op.run(stream);
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "Failed to execute split-K grouped GEMM");
+}
+
+void cuda_graph_splitk_grouped_gemm(cutlass::gemm::GemmCoord const* problem_sizes_ptr, int problem_count,
+    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu,
+    void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, bool isLoraIn, nvinfer1::DataType dataType,
+    int splitKSlices, int minKN, cudaStream_t stream)
+{
+    // Based on splitkGroupGemm.cu logic for kernel selection
+    if (dataType == nvinfer1::DataType::kHALF)
+    {
+        if (isLoraIn)
+        {
+            // K >> N, like K = 1024, N = 8
+            if (minKN >= 8)
+            {
+                cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 8, 4>(
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+            }
+            else if (minKN >= 4)
+            {
+                cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 4, 4>(
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+            }
+            else if (minKN >= 2)
+            {
+                cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 2, 2>(
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+            }
+            else
+            {
+                cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 1, 2>(
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+            }
+        }
+        else
+        {
+            // N >> K, like K = 8, N = 1024
+            if (minKN >= 8)
+            {
+                cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::half_t, 8, 8, 4>(
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+            }
+            else if (minKN >= 4)
+            {
+                cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::half_t, 4, 8, 4>(
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+            }
+            else if (minKN >= 2)
+            {
+                cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::half_t, 2, 8, 2>(
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+            }
+            else
+            {
+                cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::half_t, 1, 8, 2>(
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+            }
+        }
+    }
+    else if (dataType == nvinfer1::DataType::kBF16)
+    {
+        // Similar template instantiations for bfloat16
+        if (isLoraIn)
+        {
+            if (minKN >= 8)
+            {
+                cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::bfloat16_t, 8, 8, 4>(
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+            }
+            else
+            {
+                cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::bfloat16_t, 8, 1, 2>(
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+            }
+        }
+        else
+        {
+            if (minKN >= 8)
+            {
+                cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::bfloat16_t, 8, 8, 4>(
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+            }
+            else
+            {
+                cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::bfloat16_t, 1, 8, 2>(
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
+                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+            }
+        }
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(false, "Unsupported data type for CUDA Graph split-K grouped GEMM");
+    }
+}
+
+} // namespace kernels
+} // namespace tensorrt_llm
