@@ -6,7 +6,7 @@ with multi-LoRA by using persistent device tensors for group GEMM operations.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -41,12 +41,6 @@ class LoraLayerParams:
     d_ld_d: torch.Tensor  # Leading dimension for intermediate output D
     d_ld_b_prime: torch.Tensor  # Leading dimension for lora_out weights B'
     d_ld_d_prime: torch.Tensor  # Leading dimension for final output D'
-
-    # Base addresses for intermediate buffers (set during graph capture)
-    intermediate_buffer_base: Optional[
-        torch.Tensor] = None  # Base address for d buffer
-    output_buffer_base: Optional[
-        torch.Tensor] = None  # Base address for d' buffer
 
     def __post_init__(self):
         """Validate tensor shapes after initialization."""
@@ -84,7 +78,9 @@ class CudaGraphLoraParams:
                  max_lora_size: int,
                  layer_module_nums: List[int],
                  max_ranks: List[int],
+                 max_rank: int,
                  output_sizes: List[List[int]],
+                 input_hidden_sizes: List[int],
                  device: str = "cuda",
                  dtype: torch.dtype = torch.int32):
         """
@@ -96,19 +92,29 @@ class CudaGraphLoraParams:
             max_lora_size: Maximum number of LoRA adapters
             layer_module_nums: Number of modules per layer (e.g., [3, 3, ...] for q,k,v per layer)
             max_ranks: Maximum rank for each layer
+            max_rank: Maximum rank for all layers
             output_sizes: Output sizes for each module in each layer
+            input_hidden_sizes: Input hidden sizes for each layer
             device: Device to allocate tensors on
             dtype: Data type for size and offset tensors
         """
         self.num_layers = num_layers
         self.max_batch_size = max_batch_size
         self.max_lora_size = max_lora_size
+        self.max_rank = max_rank
         self.layer_module_nums = layer_module_nums
         self.device = device
         self.dtype = dtype
 
-        # Per-layer parameters
+        # Sparse per-layer parameters (only for layers with LoRA modules)
+        # Map: layer_idx -> LoraLayerParams (only contains layers with layer_module_nums[layer_idx] > 0)
         self.layer_params: Dict[int, LoraLayerParams] = {}
+
+        # Store layer configurations for quick access
+        self.active_layer_indices: List[int] = [
+        ]  # Indices of layers with LoRA modules
+        self.layer_info: Dict[int, Dict[str, Any]] = {
+        }  # layer_idx -> {module_num, max_rank, output_sizes}
 
         # Global slot assignment for the batch
         # Shape: [max_batch_size], values in [0, max_lora_size] where max_lora_size is for base model
@@ -123,12 +129,28 @@ class CudaGraphLoraParams:
                                       dtype=torch.int64,
                                       device=device)
 
-        # Initialize per-layer parameters
+        # Initialize per-layer parameters ONLY for layers with LoRA modules
         for layer_idx in range(num_layers):
-            self.layer_params[layer_idx] = self._create_layer_params(
-                layer_idx, layer_module_nums[layer_idx], max_ranks[layer_idx],
-                output_sizes[layer_idx]
-                if layer_idx < len(output_sizes) else [])
+            layer_module_num = layer_module_nums[layer_idx]
+            if layer_module_num > 0:  # Only create params for layers with LoRA modules
+                max_rank = max_ranks[layer_idx]
+                output_size = output_sizes[layer_idx] if layer_idx < len(
+                    output_sizes) else []
+                input_hidden_size = input_hidden_sizes[
+                    layer_idx] if layer_idx < len(input_hidden_sizes) else 0
+
+                # Store layer information
+                self.active_layer_indices.append(layer_idx)
+                self.layer_info[layer_idx] = {
+                    'module_num': layer_module_num,
+                    'max_rank': max_rank,
+                    'output_sizes': torch.tensor(output_size),
+                    'input_hidden_size': input_hidden_size
+                }
+
+                # Create layer parameters
+                self.layer_params[layer_idx] = self._create_layer_params(
+                    layer_idx, layer_module_num, max_rank, output_size)
 
     def _create_layer_params(self, layer_idx: int, layer_module_num: int,
                              max_rank: int,
@@ -153,6 +175,7 @@ class CudaGraphLoraParams:
         return LoraLayerParams(
             # GEMM sizes - stored in cutlass::gemm::GemmCoord format (3 int32 values: m, n, k)
             # This allows direct GPU pointer casting without .item() calls
+            # cutlass::gemm::GemmCoord uses int32
             d_lora_in_sizes=torch.zeros(shape_3d,
                                         dtype=torch.int32,
                                         device=self.device),
@@ -180,14 +203,14 @@ class CudaGraphLoraParams:
                                        device=self.device),
 
             # Leading dimensions - use int32 to match GEMM API expectations
-            d_ld_a=torch.zeros(shape_2d, dtype=torch.int32, device=self.device),
-            d_ld_b=torch.zeros(shape_2d, dtype=torch.int32, device=self.device),
-            d_ld_d=torch.zeros(shape_2d, dtype=torch.int32, device=self.device),
+            d_ld_a=torch.zeros(shape_2d, dtype=torch.int64, device=self.device),
+            d_ld_b=torch.zeros(shape_2d, dtype=torch.int64, device=self.device),
+            d_ld_d=torch.zeros(shape_2d, dtype=torch.int64, device=self.device),
             d_ld_b_prime=torch.zeros(shape_2d,
-                                     dtype=torch.int32,
+                                     dtype=torch.int64,
                                      device=self.device),
             d_ld_d_prime=torch.zeros(shape_2d,
-                                     dtype=torch.int32,
+                                     dtype=torch.int64,
                                      device=self.device),
         )
 
@@ -226,7 +249,7 @@ class CudaGraphLoraParams:
                 dtype=torch.int64,
                 device=self.device)
 
-    def update_weight_pointers(self, peft_table: "PeftTable",
+    def update_weight_pointers(self, peft_table: Dict[int, List],
                                slot_to_task_mapping: Dict[int, Optional[int]]):
         """
         Update weight pointers from PEFT cache manager.
@@ -235,15 +258,18 @@ class CudaGraphLoraParams:
             peft_table: PEFT table from cache manager containing weight pointers
             slot_to_task_mapping: Mapping from slot_id to task_id
         """
-        # Reset all pointers to null (0)
-        for layer_idx in range(self.num_layers):
+        host_weight_in_ptrs = dict()
+        host_weight_out_ptrs = dict()
+        for layer_idx in self.active_layer_indices:
             layer_params = self.layer_params[layer_idx]
-            layer_params.d_b_ptrs.zero_()
-            layer_params.d_b_prime_ptrs.zero_()
+            host_weight_in_ptrs[layer_idx] = torch.zeros_like(
+                layer_params.d_b_ptrs, device='cpu')
+            host_weight_out_ptrs[layer_idx] = torch.zeros_like(
+                layer_params.d_b_prime_ptrs, device='cpu')
 
         # Fill in pointers for active slots
         for slot_id, task_id in slot_to_task_mapping.items():
-            # Only process actual LoRA slots (0 to max_lora_size-1)
+            # Only process actual LoRA slots (0 to max_lora_size-1), for empty slot, values have been set to 0
             if slot_id >= self.max_lora_size or task_id is None or task_id not in peft_table:
                 continue
 
@@ -254,105 +280,136 @@ class CudaGraphLoraParams:
                 layer_id = config.layer_id
                 module_id = config.module_id
 
-                if layer_id < self.num_layers:
-                    layer_params = self.layer_params[layer_id]
+                # Only process layers that have LoRA modules
+                assert layer_id in self.layer_params, f"Layer {layer_id} not found in layer_params, assumption that all LoRA has their adapters on the same layers is broken"
+                layer_params = self.layer_params[layer_id]
 
-                    # Set weight pointers for this slot and module
-                    if hasattr(config, 'in_pointer') and hasattr(
-                            config, 'out_pointer'):
-                        layer_params.d_b_ptrs[module_id,
-                                              slot_id] = config.in_pointer
-                        layer_params.d_b_prime_ptrs[
-                            module_id, slot_id] = config.out_pointer
+                # Validate LoRA rank - TaskLayerModuleConfig uses 'rank' attribute
+                rank = config.adapter_size
+                assert rank <= self.max_rank, f"LoRA rank {rank} in layer {layer_id} exceeds configured max_rank {self.max_rank}. "
+
+                # Set weight pointers for this slot and module
+                host_weight_in_ptrs[layer_id][
+                    module_id, slot_id] = config.weights_in_pointer
+                host_weight_out_ptrs[layer_id][
+                    module_id, slot_id] = config.weights_out_pointer
+
+        for layer_idx, layer_param in self.layer_params.items():
+            layer_param.d_b_ptrs.copy_(host_weight_in_ptrs[layer_idx])
+            layer_param.d_b_prime_ptrs.copy_(host_weight_out_ptrs[layer_idx])
+
+        # compute ld's
+        for layer_idx, layer_param in self.layer_params.items():
+            # a [bs, hidden]
+            input_hidden_size = self.layer_info[layer_idx]['input_hidden_size']
+            layer_param.d_ld_a.fill_(input_hidden_size)
+
+            # a_prime / d [num_layer_modules, bs, max_rank]
+            layer_param.d_ld_d.fill_(self.max_rank)
+
+            # b / b_prime store as column major, so their ld should be row number
+            # b [input_hidden_size, lora_rank]
+            layer_param.d_ld_b.fill_(input_hidden_size)
+
+            # d_prime [bs, sum_of_each_module_output_sizes]
+            layer_param.d_ld_d_prime.fill_(
+                torch.sum(self.layer_info[layer_idx]['output_sizes']))
 
     def update_gemm_sizes_and_offsets(self, batch_size: int,
                                       input_hidden_size: int,
-                                      slot_counts: Dict[int, int],
+                                      slot_counts: torch.Tensor,
                                       slot_to_task_mapping: Dict[int,
                                                                  Optional[int]],
-                                      peft_table: "PeftTable"):
+                                      peft_table: Dict[int, List]):
         """
         Update GEMM sizes and buffer offsets based on current batch composition.
 
         Args:
             batch_size: Current batch size
             input_hidden_size: Hidden size of input tensors
-            slot_counts: Number of tokens for each slot_id in the batch
+            slot_counts: Number of tokens for each slot_id in the batch, shape: [max_lora_size,]
             slot_to_task_mapping: Mapping from slot_id to task_id
             peft_table: PEFT table containing adapter configurations
         """
-        for layer_idx in range(self.num_layers):
-            layer_params = self.layer_params[layer_idx]
-            layer_module_num = self.layer_module_nums[layer_idx]
 
-            # Reset sizes and offsets
-            layer_params.d_lora_in_sizes.zero_()
-            layer_params.d_lora_out_sizes.zero_()
-            layer_params.d_a_offset.zero_()
-            layer_params.d_d_offset.zero_()
-            layer_params.d_d_prime_offset.zero_()
+        def get_offset_from_counts(counts: torch.Tensor) -> torch.Tensor:
+            offset = torch.roll(counts, 1, dims=0)
+            offset[0] = 0
+            offset = torch.cumsum(offset, dim=0)
+            return offset
 
-            current_input_offset = 0
-            current_intermediate_offset = 0
-            current_output_offset = 0
+        slot_token_offset = get_offset_from_counts(slot_counts)
+        assert slot_token_offset.shape == (self.max_lora_size, )
 
-            for slot_id in range(self.max_lora_size
-                                 ):  # Only actual LoRA slots, no dummy slot
-                task_id = slot_to_task_mapping.get(slot_id)
-                token_count = slot_counts.get(slot_id, 0)
+        # get slot ranks
+        # assume ranks are the same within a slot,
+        # input_hidden_size are the same within a layer
+        # output sizes are the same within a layer
+        ranks = torch.zeros(self.max_lora_size, dtype=torch.int32)
 
-                if task_id is None or task_id not in peft_table or token_count == 0:
-                    continue
+        for slot_id in range(self.max_lora_size):
+            task_id = slot_to_task_mapping.get(slot_id)
+            if task_id is None or task_id not in peft_table:
+                continue
+            task_configs = peft_table[task_id]
+            config = task_configs[0]
+            ranks[slot_id] = config.adapter_size
 
-                # Find configurations for this layer and task
-                task_configs = peft_table[task_id]
-                layer_configs = [
-                    cfg for cfg in task_configs if cfg.layer_id == layer_idx
-                ]
+        # offset shapes [num_layer_modules, max_lora_size]
+        for layer_idx, layer_params in self.layer_params.items():
+            # reordered a [bs, hidden], each module has the same offset
+            dst_shape = layer_params.d_a_offset.shape
+            layer_params.d_a_offset.copy_(
+                slot_token_offset.unsqueeze(0).expand(dst_shape))
 
-                for module_id, config in enumerate(layer_configs):
-                    if module_id >= layer_module_num:
-                        break
+            # d [num_layer_modules, bs, max_rank]
+            d_offset = slot_token_offset.unsqueeze(0) + torch.arange(
+                dst_shape[0]).unsqueeze(1) * self.max_lora_size
+            # [num_layer_modules, max_lora_size] = [1, max_lora_size] + [num_layer_modules, 1]
+            layer_params.d_d_offset.copy_(d_offset)
 
-                    rank = getattr(config, 'rank', 0)
-                    output_size = getattr(config, 'out_dim', input_hidden_size)
+            # d' [bs, sum_of_each_module_output_sizes]
+            bs_offset = slot_token_offset.unsqueeze(0)  # [1, max_lora_size]
+            out_sizes = self.layer_info[layer_idx]['output_sizes']
+            sum_out_sizes = torch.sum(out_sizes)
+            bs_offset *= sum_out_sizes
 
-                    # Set GEMM sizes for lora_in: [M, N, K] = [token_count, input_hidden_size, rank]
-                    layer_params.d_lora_in_sizes[module_id, slot_id,
-                                                 0] = token_count  # M
-                    layer_params.d_lora_in_sizes[module_id, slot_id,
-                                                 1] = input_hidden_size  # N
-                    layer_params.d_lora_in_sizes[module_id, slot_id,
-                                                 2] = rank  # K
+            out_offset = get_offset_from_counts(out_sizes).unsqueeze(
+                1)  # [num_layer_modules, 1]
 
-                    # Set GEMM sizes for lora_out: [M, N, K] = [token_count, rank, output_size]
-                    layer_params.d_lora_out_sizes[module_id, slot_id,
-                                                  0] = token_count  # M
-                    layer_params.d_lora_out_sizes[module_id, slot_id,
-                                                  1] = rank  # N
-                    layer_params.d_lora_out_sizes[module_id, slot_id,
-                                                  2] = output_size  # K
+            layer_params.d_d_prime_offset.copy_(bs_offset + out_offset)
 
-                    # Set offsets (will be converted to actual addresses later)
-                    layer_params.d_a_offset[module_id,
-                                            slot_id] = current_input_offset
-                    layer_params.d_d_offset[
-                        module_id, slot_id] = current_intermediate_offset
-                    layer_params.d_d_prime_offset[
-                        module_id, slot_id] = current_output_offset
+            # sizes
+            input_hidden_size = torch.IntTensor(
+                self.layer_info[layer_idx]['input_hidden_size']).reshape(
+                    (1,
+                     1)).expand(dst_shape)  # [num_layer_modules, max_lora_size]
+            input_hidden_size = input_hidden_size.unsqueeze(-1)
 
-                # Update offsets for next slot
-                current_input_offset += token_count * input_hidden_size
-                # Intermediate buffer size depends on max rank across modules
-                max_rank = max(
-                    [getattr(cfg, 'rank', 0) for cfg in layer_configs] + [0])
-                current_intermediate_offset += token_count * max_rank
-                # Output buffer size depends on sum of output sizes across modules
-                total_output_size = sum([
-                    getattr(cfg, 'out_dim', input_hidden_size)
-                    for cfg in layer_configs
-                ])
-                current_output_offset += token_count * total_output_size
+            token_counts = slot_counts.unsqueeze(0).expand(
+                dst_shape)  # [num_layer_modules, max_lora_size]
+            token_counts = token_counts.unsqueeze(-1)
+
+            _ranks = ranks.unsqueeze(0).expand(
+                dst_shape)  # [num_layer_modules, max_lora_size]
+            _ranks = _ranks.unsqueeze(-1)
+
+            output_sizes = self.layer_info[layer_idx]['output_sizes'].unsqueeze(
+                1).expand(dst_shape)  # [num_layer_modules, max_lora_size]
+            output_sizes = output_sizes.unsqueeze(-1)
+
+            layer_params.d_lora_in_sizes.copy_(
+                torch.cat([token_counts, input_hidden_size, _ranks], dim=-1))
+            layer_params.d_lora_out_sizes.copy_(
+                torch.cat([token_counts, _ranks, output_sizes], dim=-1))
+
+            # fill ldb_prime lora ranks
+            # b_prime [lora_rank, module_output_size]
+            layer_params.d_ld_b_prime.copy_(
+                ranks.unsqueeze(0).expand(dst_shape))
+            # TODO: is this correct?
+
+            # TODO: store only one of this
 
     def get_problem_count(self, layer_idx: int) -> int:
         """
@@ -363,11 +420,14 @@ class CudaGraphLoraParams:
 
         Returns:
             Number of GEMM problems (layer_module_num * max_lora_size)
+            Returns 0 if layer has no LoRA modules
             Note: Only actual LoRA slots are counted, not the dummy base model slot
         """
-        return self.layer_module_nums[layer_idx] * self.max_lora_size
+        if layer_idx not in self.layer_params:
+            return 0  # Layer has no LoRA modules
+        return self.layer_info[layer_idx]['module_num'] * self.max_lora_size
 
-    def get_layer_params(self, layer_idx: int) -> LoraLayerParams:
+    def get_layer_params(self, layer_idx: int) -> Optional[LoraLayerParams]:
         """
         Get LoRA parameters for a specific layer.
 
@@ -375,6 +435,41 @@ class CudaGraphLoraParams:
             layer_idx: Index of the layer
 
         Returns:
-            LoraLayerParams for the specified layer
+            LoraLayerParams for the specified layer, or None if layer has no LoRA modules
         """
-        return self.layer_params[layer_idx]
+        return self.layer_params.get(layer_idx)
+
+    def has_lora_modules(self, layer_idx: int) -> bool:
+        """
+        Check if a layer has LoRA modules.
+
+        Args:
+            layer_idx: Index of the layer
+
+        Returns:
+            True if the layer has LoRA modules, False otherwise
+        """
+        return layer_idx in self.layer_params
+
+    def get_active_layers(self) -> List[int]:
+        """
+        Get list of layer indices that have LoRA modules.
+
+        Returns:
+            List of layer indices with LoRA modules
+        """
+        return self.active_layer_indices.copy()
+
+    def get_layer_module_count(self, layer_idx: int) -> int:
+        """
+        Get the number of modules in a layer.
+
+        Args:
+            layer_idx: Index of the layer
+
+        Returns:
+            Number of modules in the layer, or 0 if layer has no LoRA modules
+        """
+        if layer_idx not in self.layer_info:
+            return 0
+        return self.layer_info[layer_idx]['module_num']

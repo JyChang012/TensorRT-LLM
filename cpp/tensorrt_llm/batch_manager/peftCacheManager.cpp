@@ -462,10 +462,8 @@ PeftCacheManager::PeftTable PeftCacheManager::ensureBatch(
     {
         auto&& f = ensureFutures.at(taskId);
         auto const values = f.get();
-        for (auto const& reqId : reqIds)
-        {
-            peftTable.try_emplace(reqId, values);
-        }
+        // Map task_id to layer-module-configs instead of request_id to layer-module-configs
+        peftTable.try_emplace(taskId, values);
     }
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
     return peftTable;

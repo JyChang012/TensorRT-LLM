@@ -185,16 +185,15 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
     th::Tensor const& sorted_ids,          // [batch_size] - sorted indices for gather/scatter
     int64_t problem_count,
     th::Tensor const& intermediate_buffer, // Intermediate buffer for d
-    th::Tensor const& output_buffer        // Output buffer for d'
-)
+    th::Tensor const& output_buffer,       // Output buffer for d'
+    th::Tensor const& lda,                 // Leading dimensions for A matrices [layer_module_num, max_lora_size]
+    th::Tensor const& ldb,                 // Leading dimensions for B matrices [layer_module_num, max_lora_size]
+    th::Tensor const& ldd, // Leading dimensions for C matrices [layer_module_num, max_lora_size] (unused)
+    th::Tensor const& ldb_prime, th::Tensor const& ldd_prime)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    auto batch_size = slot_ids.sizes()[0];
-    auto layer_module_num = lora_in_sizes.sizes()[0];
-    auto max_lora_size = lora_in_sizes.sizes()[1];
-    auto hidden_size = input.sizes()[input.sizes().size() - 1];
 
     // Create reordered input buffer using gather operation with sorted_ids
     // This replaces the physical reordering with efficient gather/scatter
@@ -250,6 +249,13 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
     auto* b_ptrs_gpu = reinterpret_cast<void* const*>(b_ptrs.data_ptr());
     auto* b_prime_ptrs_gpu = reinterpret_cast<void* const*>(b_prime_ptrs.data_ptr());
 
+    // Step 4.5: Get precomputed leading dimension pointers for GEMM operations
+    auto* lda_gpu = reinterpret_cast<int64_t const*>(lda.data_ptr());
+    auto* ldb_gpu = reinterpret_cast<int64_t const*>(ldb.data_ptr());
+    auto* ldd_gpu = reinterpret_cast<int64_t const*>(ldd.data_ptr());
+    auto* ldb_prime_gpu = reinterpret_cast<int64_t const*>(ldb_prime.data_ptr());
+    auto* ldd_prime_gpu = reinterpret_cast<int64_t const*>(ldd_prime.data_ptr());
+
     // Step 5: Direct CUTLASS grouped GEMM setup (no CuBLAS wrapper needed)
     // The new CUDA Graph compatible implementation uses CUTLASS directly
 
@@ -272,14 +278,14 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
     if (problem_count > 0)
     {
         tk::cuda_graph_splitk_grouped_gemm(problem_sizes_1_ptr, problem_count, a_ptrs_gpu, b_ptrs_gpu,
-            nullptr,                        // ptrC (no bias)
-            d_ptrs_gpu,
-            execution_workspace.data_ptr(), // Only execution workspace needed
+            d_ptrs_gpu,                                     // ptrC (no bias)
+            d_ptrs_gpu, lda_gpu, ldb_gpu, ldd_gpu, ldd_gpu, // Precomputed leading dimensions
+            execution_workspace.data_ptr(),                 // Only execution workspace needed
             execution_workspace_size,
-            true,                           // isLoraIn
+            true,                                           // isLoraIn
             loraRuntimeDataType,
-            4,                              // splitKSlices
-            1,                              // minKN
+            4,                                              // splitKSlices
+            1,                                              // minKN
             stream);
     }
 
@@ -287,13 +293,13 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
     if (problem_count > 0)
     {
         tk::cuda_graph_grouped_gemm(problem_sizes_2_ptr, problem_count, a_prime_ptrs_gpu, b_prime_ptrs_gpu,
-            nullptr,                        // ptrC (no bias)
-            d_prime_ptrs_gpu,
-            execution_workspace.data_ptr(), // Only execution workspace needed
+            d_prime_ptrs_gpu,                                                       // ptrC (no bias)
+            d_prime_ptrs_gpu, ldd_gpu, ldb_prime_gpu, ldd_prime_gpu, ldd_prime_gpu, // Precomputed leading dimensions
+            execution_workspace.data_ptr(),                                         // Only execution workspace needed
             execution_workspace_size,
-            false,                          // isLoraIn
+            false,                                                                  // isLoraIn
             loraRuntimeDataType,
-            1,                              // minKN
+            1,                                                                      // minKN
             stream);
     }
 
@@ -336,7 +342,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor sorted_ids, "
         "int problem_count, "
         "Tensor intermediate_buffer, "
-        "Tensor output_buffer) -> Tensor");
+        "Tensor output_buffer, "
+        "Tensor lda, "
+        "Tensor ldb, "
+        "Tensor ldd, "
+        "Tensor ldb_prime, "
+        "Tensor ldd_prime) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

@@ -461,7 +461,7 @@ class PyTorchModelEngine(ModelEngine):
 
         # Initialize CUDA Graph LoRA manager if LoRA is enabled
         self.cuda_graph_lora_manager: Optional[CudaGraphLoraManager] = None
-        if lora_config is not None and pytorch_backend_config.use_cuda_graph:
+        if lora_config is not None:
             self._init_cuda_graph_lora_manager(lora_config)
 
         # Setup the local cache indirection buffer only once and reuse it.
@@ -497,42 +497,16 @@ class PyTorchModelEngine(ModelEngine):
             model_config = self.model.config
             num_layers = model_config.num_hidden_layers
             max_lora_size = lora_config.max_loras or 8  # Default fallback
+            max_batch_size = self.batch_size  # Use engine's max batch size
 
-            # Calculate layer module numbers based on target modules
-            # This is a simplified version - in practice, this should be computed
-            # based on the actual model architecture and target modules
-            num_attention_modules = 0
-            num_mlp_modules = 0
-
-            for module in lora_config.lora_target_modules:
-                if 'attention' in module.lower() or any(
-                        x in module.lower() for x in ['q', 'k', 'v', 'qkv']):
-                    num_attention_modules += 1
-                elif any(x in module.lower()
-                         for x in ['mlp', 'gate', 'up', 'down']):
-                    num_mlp_modules += 1
-
-            # Assume uniform layer structure for simplicity
-            layer_module_nums = [max(num_attention_modules, num_mlp_modules)
-                                 ] * num_layers
-
-            # Set reasonable defaults for max ranks and output sizes
-            hidden_size = model_config.hidden_size
-            max_ranks = [lora_config.max_lora_rank] * num_layers
-
-            # Output sizes depend on the modules - simplified estimation
-            output_sizes = []
-            for layer_idx in range(num_layers):
-                layer_output_sizes = [hidden_size
-                                      ] * layer_module_nums[layer_idx]
-                output_sizes.append(layer_output_sizes)
-
+            # Defer layer module configuration until we have access to actual peft_table
+            # This avoids incorrect assumptions about uniform layer structure
             self.cuda_graph_lora_manager = CudaGraphLoraManager(
                 num_layers=num_layers,
                 max_lora_size=max_lora_size,
-                layer_module_nums=layer_module_nums,
-                max_ranks=max_ranks,
-                output_sizes=output_sizes,
+                max_batch_size=max_batch_size,
+                max_lora_rank=lora_config.max_lora_rank,
+                hidden_size=model_config.hidden_size,
                 device='cuda')
 
             logger.info(
@@ -2174,8 +2148,7 @@ class PyTorchModelEngine(ModelEngine):
             Dictionary containing LoRA parameters, or None if no LoRA requests
         '''
         # Check if we should use CUDA Graph mode
-        use_cuda_graph_mode = (self.cuda_graph_lora_manager is not None
-                               and self.pytorch_backend_config.use_cuda_graph)
+        use_cuda_graph_mode = self.cuda_graph_lora_manager is not None
 
         if use_cuda_graph_mode:
             # Get PEFT table from resource manager if available
@@ -2186,9 +2159,18 @@ class PyTorchModelEngine(ModelEngine):
                     return self._get_legacy_lora_params_from_requests(
                         scheduled_requests, attn_metadata)
 
-                # Get PEFT table - this would need to be passed from the resource manager
-                # For now, using empty dict as placeholder - this needs proper integration
+                # Get PEFT table from request's py_lora_task_layer_module_configs
+                # Since all requests with the same task_id have the same layer-module-configs,
+                # we can extract it from any request that has LoRA configurations
                 peft_table = {}
+                request_list = scheduled_requests.context_requests + scheduled_requests.generation_requests
+
+                for request in request_list:
+                    if (hasattr(request, 'py_lora_task_layer_module_configs')
+                            and request.py_lora_task_layer_module_configs
+                            is not None):
+                        peft_table = request.py_lora_task_layer_module_configs
+                        break
 
                 return self.cuda_graph_lora_manager.prepare_cuda_graph_lora_params(
                     scheduled_requests, attn_metadata, peft_table)

@@ -5,8 +5,7 @@ This module provides a manager that coordinates AdapterSlotManager, CudaGraphLor
 and PeftCacheManager to enable CUDA Graph capture with multi-LoRA support.
 """
 
-from collections import Counter
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 
@@ -32,9 +31,9 @@ class CudaGraphLoraManager:
     def __init__(self,
                  num_layers: int,
                  max_lora_size: int,
-                 layer_module_nums: List[int],
-                 max_ranks: List[int],
-                 output_sizes: List[List[int]],
+                 max_batch_size: int,
+                 max_lora_rank: int,
+                 hidden_size: int,
                  device: str = "cuda"):
         """
         Initialize the CUDA Graph LoRA manager.
@@ -42,45 +41,136 @@ class CudaGraphLoraManager:
         Args:
             num_layers: Number of model layers
             max_lora_size: Maximum number of LoRA adapters that can be active
-            layer_module_nums: Number of modules per layer (e.g., [3, 3, ...] for q,k,v)
-            max_ranks: Maximum rank for each layer
-            output_sizes: Output sizes for each module in each layer
+            max_batch_size: Maximum batch size for CUDA graphs
+            max_lora_rank: Maximum LoRA rank across all layers
+            hidden_size: Hidden dimension size of the model
             device: Device to allocate tensors on
         """
         self.num_layers = num_layers
         self.max_lora_size = max_lora_size
+        self.max_batch_size = max_batch_size
+        self.max_lora_rank = max_lora_rank
+        self.hidden_size = hidden_size
         self.device = device
 
         self.adapter_slot_manager = AdapterSlotManager(max_lora_size, device)
 
-        # Store lora_params for different batch sizes
-        self.batch_size_to_lora_params: Dict[int, CudaGraphLoraParams] = {}
+        # Single CudaGraphLoraParams instance for all batch sizes
+        # Will be initialized lazily when we have access to peft_table
+        self.cuda_graph_lora_params: Optional[CudaGraphLoraParams] = None
+        self._is_initialized = False
 
-        # Configuration for creating lora_params
-        self.layer_module_nums = layer_module_nums
-        self.max_ranks = max_ranks
-        self.output_sizes = output_sizes
-
-    def get_or_create_lora_params(self, batch_size: int) -> CudaGraphLoraParams:
+    def _initialize_from_peft_table(self, peft_table: "PeftTable"):
         """
-        Get or create CudaGraphLoraParams for a specific batch size.
+        Initialize CudaGraphLoraParams using actual layer configuration from peft_table.
+
+        This method extracts the real layer module counts from a non-empty slot in peft_table,
+        avoiding incorrect assumptions about uniform layer structure.
 
         Args:
-            batch_size: The batch size to get/create params for
+            peft_table: PEFT table containing actual LoRA layer configurations
+        """
+        if self._is_initialized:
+            return
+
+        # Find the first non-empty slot to get layer configuration
+        layer_module_nums = []
+        max_ranks = []
+        output_sizes = []
+        input_hidden_sizes = []
+
+        # Get configuration from the first available task
+        sample_task_id = None
+        for task_id, configs in peft_table.items():
+            if configs:  # Non-empty configuration
+                sample_task_id = task_id
+                break
+
+        if sample_task_id is None:
+            # Fallback to default configuration if no tasks available
+            layer_module_nums = [
+                0
+            ] * self.num_layers  # Assume 1 module per layer
+            max_ranks = [self.max_lora_rank] * self.num_layers
+            output_sizes = [[self.hidden_size]] * self.num_layers
+            input_hidden_sizes = [self.hidden_size] * self.num_layers
+        else:
+            # Extract actual configuration from sample task
+            configs = peft_table[sample_task_id]
+
+            # Group by layer to count modules per layer
+            layer_to_modules = {}
+            for config in configs:
+                layer_idx = config.layer_id
+                if layer_idx not in layer_to_modules:
+                    layer_to_modules[layer_idx] = []
+                layer_to_modules[layer_idx].append(config)
+            for layer_idx, modules in layer_to_modules.items():
+                modules.sort(
+                    key=lambda x: x.module_id)  # TODO: work around for now
+
+            # Build layer configuration arrays
+            for layer_idx in range(self.num_layers):
+                if layer_idx in layer_to_modules:
+                    modules = layer_to_modules[layer_idx]
+                    layer_module_nums.append(len(modules))
+
+                    # Validate ranks and get maximum rank for this layer
+                    layer_ranks = []
+                    for config in modules:
+                        # TaskLayerModuleConfig uses 'rank' attribute, not 'lora_rank'
+                        rank = config.adapter_size
+                        if rank > self.max_lora_rank:
+                            raise ValueError(
+                                f"LoRA rank {rank} in layer {layer_idx} exceeds max_lora_rank {self.max_lora_rank}. "
+                                f"Please increase max_lora_rank in LoraConfig or reduce the LoRA rank."
+                            )
+                        layer_ranks.append(rank)
+
+                    layer_max_rank = max(layer_ranks)
+                    max_ranks.append(layer_max_rank)
+                    # Get output sizes for each module - TaskLayerModuleConfig uses 'out_dim'
+                    module_output_sizes = [
+                        config.out_size for config in modules
+                    ]
+                    output_sizes.append(module_output_sizes)
+                    input_hidden_sizes.append(modules[0].in_size)
+                else:
+                    # Layer has no LoRA modules
+                    layer_module_nums.append(0)
+                    max_ranks.append(0)
+                    output_sizes.append([])
+                    input_hidden_sizes.append(0)
+
+        # Create the single CudaGraphLoraParams instance
+        self.cuda_graph_lora_params = CudaGraphLoraParams(
+            num_layers=self.num_layers,
+            max_batch_size=self.max_batch_size,
+            max_lora_size=self.max_lora_size,
+            layer_module_nums=layer_module_nums,
+            max_ranks=max_ranks,
+            max_rank=self.max_lora_rank,
+            output_sizes=output_sizes,
+            input_hidden_sizes=input_hidden_sizes,
+            device=self.device)
+
+        self._is_initialized = True
+
+    def get_or_create_lora_params(
+            self, peft_table: "PeftTable") -> CudaGraphLoraParams:
+        """
+        Get or create the single CudaGraphLoraParams instance.
+
+        Args:
+            peft_table: PEFT table for initializing layer configuration
 
         Returns:
-            CudaGraphLoraParams for the specified batch size
+            The single CudaGraphLoraParams instance
         """
-        if batch_size not in self.batch_size_to_lora_params:
-            self.batch_size_to_lora_params[batch_size] = CudaGraphLoraParams(
-                num_layers=self.num_layers,
-                max_batch_size=batch_size,
-                max_lora_size=self.max_lora_size,
-                layer_module_nums=self.layer_module_nums,
-                max_ranks=self.max_ranks,
-                output_sizes=self.output_sizes,
-                device=self.device)
-        return self.batch_size_to_lora_params[batch_size]
+        if not self._is_initialized:
+            self._initialize_from_peft_table(peft_table)
+
+        return self.cuda_graph_lora_params
 
     def prepare_cuda_graph_lora_params(
             self, scheduled_requests: "ScheduledRequests",
@@ -115,20 +205,21 @@ class CudaGraphLoraManager:
         request_to_slot_id = self.adapter_slot_manager.get_slot_mapping_for_batch(
             scheduled_requests)
 
-        # Count tokens per slot (excluding base model requests at max_lora_size)
-        slot_counts = Counter()
-        for slot_id in request_to_slot_id.values():
-            if slot_id != self.max_lora_size:  # Skip base model requests
-                slot_counts[slot_id] += 1
-
-        # Get or create lora_params for this batch size
-        cuda_graph_lora_params = self.get_or_create_lora_params(batch_size)
+        # Get or create the single lora_params instance using peft_table for configuration
+        cuda_graph_lora_params = self.get_or_create_lora_params(peft_table)
 
         # Update slot IDs in lora_params
         slot_ids_list = [
-            request_to_slot_id.get(req.py_request_id, 0) for req in request_list
+            request_to_slot_id.get(req.py_request_id, self.max_lora_size)
+            for req in request_list
         ]
         cuda_graph_lora_params.update_slot_ids(slot_ids_list, batch_size)
+        slot_counts = torch.bincount(torch.tensor(slot_ids_list,
+                                                  dtype=torch.int32),
+                                     minlength=self.max_lora_size)
+        assert slot_counts.size(0) <= self.max_lora_size + 1
+        slot_counts = slot_counts[:self.
+                                  max_lora_size]  # exclude the base model slot
 
         # Get current slot to task mapping
         slot_to_task_mapping = self.adapter_slot_manager.get_slot_to_task_mapping(
