@@ -134,19 +134,26 @@ class LoraLayer(torch.nn.Module):
         # Get layer-specific parameters
         layer_params = cuda_graph_params.get_layer_params(layer_idx)
 
+        # Skip layers that don't have LoRA modules
+        if layer_params is None:
+            return 0  # Pass-through for layers without LoRA modules
+
         # Use the new CUDA Graph compatible grouped GEMM operation
         # This will be implemented as a new custom operator
         try:
             # Create intermediate buffers sized for LoRA operations only (no base model)
             batch_size, hidden_size = x.shape[0], x.shape[-1]
 
-            # Intermediate buffer: only for LoRA tokens, not base model tokens
-            max_rank = max(
-                [layer_params.d_lora_in_sizes[:, :, 2].max().item(), 1])
-            intermediate_buffer_size = batch_size * max_rank  # Conservative estimate
-            intermediate_buffer = torch.zeros(intermediate_buffer_size,
-                                              dtype=x.dtype,
-                                              device=x.device)
+            # Get max_rank from layer configuration and number of modules
+            num_layer_modules = cuda_graph_params.get_layer_module_count(
+                layer_idx)
+            max_rank = cuda_graph_params.max_rank
+
+            # Intermediate buffer: [num_layer_modules, batch_size, max_rank]
+            intermediate_buffer = torch.zeros(
+                [num_layer_modules, batch_size, max_rank],
+                dtype=x.dtype,
+                device=x.device)
 
             # Output buffer: includes space for ALL tokens (LoRA + base model)
             # Base model tokens will be handled by pass-through in reordering kernels
@@ -156,11 +163,7 @@ class LoraLayer(torch.nn.Module):
                                         dtype=x.dtype,
                                         device=x.device)
 
-            # Update buffer base addresses in layer params
-            layer_params.intermediate_buffer_base = intermediate_buffer
-            layer_params.output_buffer_base = output_buffer
-
-            # Call the new CUDA Graph compatible operator with sorted indices
+            # Call the new CUDA Graph compatible operator with sorted indices and precomputed leading dimensions
             lora_outputs = torch.ops.trtllm.lora_grouped_gemm_cuda_graph(
                 x,  # Input tensor
                 layer_params.d_lora_in_sizes,  # GEMM sizes for lora_in
@@ -172,11 +175,17 @@ class LoraLayer(torch.nn.Module):
                 layer_params.d_d_prime_offset,  # Final output offsets
                 cuda_graph_params.slot_ids,  # Slot IDs (for reference)
                 cuda_graph_params.
-                sorted_ids,  # Sorted indices for gather/scatter
+                sorted_ids[:batch_size],  # Sorted indices for gather/scatter
                 cuda_graph_params.get_problem_count(
                     layer_idx),  # Number of GEMM problems
                 intermediate_buffer,  # Intermediate buffer (LoRA only)
                 output_buffer,  # Output buffer (all tokens)
+                layer_params.d_ld_a,  # Leading dimensions for A matrices
+                layer_params.d_ld_b,  # Leading dimensions for B matrices
+                layer_params.
+                d_ld_d,  # Leading dimensions for C matrices (reusing d_ld_d as placeholder)
+                layer_params.d_ld_b_prime,
+                layer_params.d_ld_d_prime,
             )
             return lora_outputs
         except AttributeError:

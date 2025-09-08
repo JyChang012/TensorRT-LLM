@@ -30,33 +30,14 @@ namespace kernels
 {
 
 /**
- * Compute leading dimensions on GPU for CUTLASS grouped GEMM
- */
-__global__ void compute_leading_dimensions_kernel(cutlass::gemm::GemmCoord const* problem_sizes, int64_t* lda,
-    int64_t* ldb, int64_t* ldc, int64_t* ldd, int problem_count)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < problem_count)
-    {
-        auto problem = problem_sizes[idx];
-
-        // LayoutA = RowMajor, LayoutB = ColumnMajor, LayoutC/D = RowMajor
-        // Leading dimensions - stride in the slowest-changing dimension
-        lda[idx] = problem.k(); // For RowMajor A[M,K], leading dim is K
-        ldb[idx] = problem.k(); // For ColumnMajor B[K,N], leading dim is K
-        ldc[idx] = problem.n(); // For RowMajor C[M,N], leading dim is N
-        ldd[idx] = problem.n(); // For RowMajor D[M,N], leading dim is N
-    }
-}
-
-/**
  * Template for CUDA Graph compatible grouped GEMM that directly uses GPU tensors
  */
 template <int M1, int N1, int K1, int M2, int N2, int K2, typename cutlassType, int kAlignmentAB, int kAlignmentC,
     int kStages>
 void cuda_graph_grouped_gemm_template(cutlass::gemm::GemmCoord const* problem_sizes_ptr, int problem_count,
-    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu,
-    void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, cudaStream_t stream)
+    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu, int64_t const* lda_gpu,
+    int64_t const* ldb_gpu, int64_t const* ldc_gpu, int64_t const* ldd_gpu, void* gemmExecutionWorkspace,
+    int64_t gemmExecutionWorkspaceSize, cudaStream_t stream)
 {
     using ElementA = cutlassType;
     using ElementB = cutlassType;
@@ -82,36 +63,15 @@ void cuda_graph_grouped_gemm_template(cutlass::gemm::GemmCoord const* problem_si
     float beta = 0.0f;
     typename Gemm::EpilogueOutputOp::Params epilogue_op(alpha, beta);
 
-    // Allocate temporary workspace for leading dimensions on GPU
-    auto ldd_size = tensorrt_llm::common::divUp(problem_count * sizeof(int64_t), 16) * 16;
-    size_t temp_workspace_size = 4 * ldd_size; // For lda, ldb, ldc, ldd
-
-    TLLM_CHECK_WITH_INFO(temp_workspace_size <= gemmExecutionWorkspaceSize,
-        "Insufficient workspace for leading dimensions. Required: %zu, Available: %ld", temp_workspace_size,
-        gemmExecutionWorkspaceSize);
-
-    char* workspace_ptr = static_cast<char*>(gemmExecutionWorkspace);
-    int64_t* lda = reinterpret_cast<int64_t*>(workspace_ptr);
-    int64_t* ldb = reinterpret_cast<int64_t*>(workspace_ptr + ldd_size);
-    int64_t* ldc = reinterpret_cast<int64_t*>(workspace_ptr + 2 * ldd_size);
-    int64_t* ldd = reinterpret_cast<int64_t*>(workspace_ptr + 3 * ldd_size);
-
-    // Compute leading dimensions on GPU using a kernel
-    int const blockSize = 256;
-    int const gridSize = (problem_count + blockSize - 1) / blockSize;
-
-    compute_leading_dimensions_kernel<<<gridSize, blockSize, 0, stream>>>(
-        problem_sizes_ptr, lda, ldb, ldc, ldd, problem_count);
-
     // Cast pointers to the correct types for CUTLASS
-    auto** ptr_A = reinterpret_cast<ElementA* const*>(ptrA_gpu);
-    auto** ptr_B = reinterpret_cast<ElementB* const*>(ptrB_gpu);
-    auto** ptr_C = reinterpret_cast<ElementOutput* const*>(ptrC_gpu);
-    auto** ptr_D = reinterpret_cast<ElementOutput* const*>(ptrD_gpu);
+    auto ptr_A = reinterpret_cast<ElementA* const*>(ptrA_gpu);
+    auto ptr_B = reinterpret_cast<ElementB* const*>(ptrB_gpu);
+    auto ptr_C = reinterpret_cast<ElementOutput* const*>(ptrC_gpu);
+    auto ptr_D = reinterpret_cast<ElementOutput* const*>(ptrD_gpu);
 
-    // Get remaining workspace for GEMM execution (after leading dimensions)
-    void* gemm_workspace = workspace_ptr + temp_workspace_size;
-    size_t gemm_workspace_size = gemmExecutionWorkspaceSize - temp_workspace_size;
+    // Use full workspace for GEMM execution (no leading dimension allocation needed)
+    void* gemm_workspace = gemmExecutionWorkspace;
+    size_t gemm_workspace_size = gemmExecutionWorkspaceSize;
 
     // Initialize the GEMM operator
     Gemm gemm_op;
@@ -119,7 +79,7 @@ void cuda_graph_grouped_gemm_template(cutlass::gemm::GemmCoord const* problem_si
     // Calculate threadblock count
     int threadblock_count = Gemm::sufficient(problem_sizes_ptr, problem_count);
 
-    // Setup arguments for grouped GEMM - directly using GPU tensor pointers
+    // Setup arguments for grouped GEMM - using precomputed leading dimensions from GPU tensors
     typename Gemm::Arguments args(problem_sizes_ptr, // GPU problem sizes
         problem_count,                               // Problem count
         threadblock_count,                           // Threadblock count
@@ -128,10 +88,10 @@ void cuda_graph_grouped_gemm_template(cutlass::gemm::GemmCoord const* problem_si
         ptr_B,                                       // GPU pointer array B
         ptr_C,                                       // GPU pointer array C (can be nullptr)
         ptr_D,                                       // GPU pointer array D
-        lda,                                         // Leading dimension A (on GPU)
-        ldb,                                         // Leading dimension B (on GPU)
-        ldc,                                         // Leading dimension C (on GPU)
-        ldd,                                         // Leading dimension D (on GPU)
+        lda_gpu,                                     // Precomputed leading dimension A (on GPU)
+        ldb_gpu,                                     // Precomputed leading dimension B (on GPU)
+        ldc_gpu,                                     // Precomputed leading dimension C (on GPU)
+        ldd_gpu,                                     // Precomputed leading dimension D (on GPU)
         problem_sizes_ptr                            // Problem sizes for host-side calculations
     );
 
@@ -153,9 +113,9 @@ void cuda_graph_grouped_gemm_template(cutlass::gemm::GemmCoord const* problem_si
 }
 
 void cuda_graph_grouped_gemm(cutlass::gemm::GemmCoord const* problem_sizes_ptr, int problem_count,
-    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu,
-    void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, bool isLoraIn, nvinfer1::DataType dataType,
-    int minKN, cudaStream_t stream)
+    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu, int64_t const* lda_gpu,
+    int64_t const* ldb_gpu, int64_t const* ldc_gpu, int64_t const* ldd_gpu, void* gemmExecutionWorkspace,
+    int64_t gemmExecutionWorkspaceSize, bool isLoraIn, nvinfer1::DataType dataType, int minKN, cudaStream_t stream)
 {
     // Based on the original groupGemm.cu logic for kernel selection
     if (dataType == nvinfer1::DataType::kHALF)
@@ -163,20 +123,20 @@ void cuda_graph_grouped_gemm(cutlass::gemm::GemmCoord const* problem_sizes_ptr, 
         if (minKN >= 128 * 128)
         {
             cuda_graph_grouped_gemm_template<128, 128, 64, 128, 128, 64, cutlass::half_t, 8, 8, 4>(problem_sizes_ptr,
-                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                gemmExecutionWorkspaceSize, stream);
+                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
+                gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
         }
         else if (minKN >= 64 * 64)
         {
             cuda_graph_grouped_gemm_template<64, 64, 64, 64, 64, 64, cutlass::half_t, 8, 8, 4>(problem_sizes_ptr,
-                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                gemmExecutionWorkspaceSize, stream);
+                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
+                gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
         }
         else
         {
             cuda_graph_grouped_gemm_template<32, 32, 32, 32, 32, 32, cutlass::half_t, 8, 8, 4>(problem_sizes_ptr,
-                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                gemmExecutionWorkspaceSize, stream);
+                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
+                gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
         }
     }
     else if (dataType == nvinfer1::DataType::kBF16)
@@ -184,20 +144,20 @@ void cuda_graph_grouped_gemm(cutlass::gemm::GemmCoord const* problem_sizes_ptr, 
         if (minKN >= 128 * 128)
         {
             cuda_graph_grouped_gemm_template<128, 128, 64, 128, 128, 64, cutlass::bfloat16_t, 8, 8, 4>(
-                problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                gemmExecutionWorkspaceSize, stream);
+                problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
+                ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
         }
         else if (minKN >= 64 * 64)
         {
             cuda_graph_grouped_gemm_template<64, 64, 64, 64, 64, 64, cutlass::bfloat16_t, 8, 8, 4>(problem_sizes_ptr,
-                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                gemmExecutionWorkspaceSize, stream);
+                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
+                gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
         }
         else
         {
             cuda_graph_grouped_gemm_template<32, 32, 32, 32, 32, 32, cutlass::bfloat16_t, 8, 8, 4>(problem_sizes_ptr,
-                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                gemmExecutionWorkspaceSize, stream);
+                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
+                gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
         }
     }
     else
@@ -212,8 +172,9 @@ void cuda_graph_grouped_gemm(cutlass::gemm::GemmCoord const* problem_sizes_ptr, 
 template <int M1, int N1, int K1, int M2, int N2, int K2, typename cutlassType, int kAlignmentAB, int kAlignmentC,
     int kStages>
 void cuda_graph_splitk_grouped_gemm_template(cutlass::gemm::GemmCoord const* problem_sizes_ptr, int problem_count,
-    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu,
-    void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, int splitKSlices, cudaStream_t stream)
+    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu, int64_t const* lda_gpu,
+    int64_t const* ldb_gpu, int64_t const* ldc_gpu, int64_t const* ldd_gpu, void* gemmExecutionWorkspace,
+    int64_t gemmExecutionWorkspaceSize, int splitKSlices, cudaStream_t stream)
 {
     using ElementA = cutlassType;
     using ElementB = cutlassType;
@@ -224,63 +185,43 @@ void cuda_graph_splitk_grouped_gemm_template(cutlass::gemm::GemmCoord const* pro
     using LayoutB = cutlass::layout::ColumnMajor;
     using LayoutC = cutlass::layout::RowMajor;
 
-    using GemmKernel = typename cutlass_extensions::gemm::kernel::DefaultSplitkGemmGrouped<ElementA, LayoutA,
+    using GemmKernel = typename cutlass::gemm::kernel::DefaultSplitkGemmGrouped<ElementA, LayoutA,
         cutlass::ComplexTransform::kNone, kAlignmentAB, ElementB, LayoutB, cutlass::ComplexTransform::kNone,
         kAlignmentAB, ElementOutput, LayoutC, ElementAccumulator, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
         cutlass::gemm::GemmShape<M1, N1, K1>, cutlass::gemm::GemmShape<M2, N2, K2>, cutlass::gemm::GemmShape<16, 8, 16>,
         cutlass::epilogue::thread::LinearCombination<ElementOutput, kAlignmentC, ElementAccumulator,
             ElementAccumulator>,
-        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle, kStages>::GemmKernel;
+        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle, kStages,
+        cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly>::GemmKernel;
 
-    using Gemm = cutlass_extensions::gemm::device::SplitkGemmGrouped<GemmKernel>;
+    using Gemm = cutlass::gemm::device::SplitkGemmGrouped<GemmKernel>;
 
     float alpha = 1.0f;
     float beta = 0.0f;
 
-    // Allocate temporary workspace for leading dimensions on GPU
-    auto ldd_size = tensorrt_llm::common::divUp(problem_count * sizeof(int64_t), 16) * 16;
-    size_t temp_workspace_size = 4 * ldd_size; // For lda, ldb, ldc, ldd
-
-    TLLM_CHECK_WITH_INFO(temp_workspace_size <= gemmExecutionWorkspaceSize,
-        "Insufficient workspace for leading dimensions. Required: %zu, Available: %ld", temp_workspace_size,
-        gemmExecutionWorkspaceSize);
-
-    char* workspace_ptr = static_cast<char*>(gemmExecutionWorkspace);
-    int64_t* lda = reinterpret_cast<int64_t*>(workspace_ptr);
-    int64_t* ldb = reinterpret_cast<int64_t*>(workspace_ptr + ldd_size);
-    int64_t* ldc = reinterpret_cast<int64_t*>(workspace_ptr + 2 * ldd_size);
-    int64_t* ldd = reinterpret_cast<int64_t*>(workspace_ptr + 3 * ldd_size);
-
-    // Compute leading dimensions on GPU
-    int const blockSize = 256;
-    int const gridSize = (problem_count + blockSize - 1) / blockSize;
-
-    compute_leading_dimensions_kernel<<<gridSize, blockSize, 0, stream>>>(
-        problem_sizes_ptr, lda, ldb, ldc, ldd, problem_count);
-
     // Cast pointers to the correct types for CUTLASS
-    auto** ptr_A = reinterpret_cast<ElementA* const*>(ptrA_gpu);
-    auto** ptr_B = reinterpret_cast<ElementB* const*>(ptrB_gpu);
-    auto** ptr_C = reinterpret_cast<ElementOutput* const*>(ptrC_gpu);
-    auto** ptr_D = reinterpret_cast<ElementOutput* const*>(ptrD_gpu);
+    auto ptr_A = reinterpret_cast<ElementA* const*>(ptrA_gpu);
+    auto ptr_B = reinterpret_cast<ElementB* const*>(ptrB_gpu);
+    auto ptr_C = reinterpret_cast<ElementOutput* const*>(ptrC_gpu);
+    auto ptr_D = reinterpret_cast<ElementOutput* const*>(ptrD_gpu);
 
-    // Get remaining workspace for GEMM execution
-    void* gemm_workspace = workspace_ptr + temp_workspace_size;
-    size_t gemm_workspace_size = gemmExecutionWorkspaceSize - temp_workspace_size;
+    // Use full workspace for GEMM execution (no leading dimension allocation needed)
+    void* gemm_workspace = gemmExecutionWorkspace;
+    size_t gemm_workspace_size = gemmExecutionWorkspaceSize;
 
     // Initialize the GEMM operator
     Gemm gemm_op;
 
-    // Setup arguments for split-K grouped GEMM
+    // Setup arguments for split-K grouped GEMM - using precomputed leading dimensions from GPU tensors
     typename Gemm::Arguments args(problem_count, // Problem count
         ptr_A,                                   // GPU pointer array A
         ptr_B,                                   // GPU pointer array B
         ptr_C,                                   // GPU pointer array C
         ptr_D,                                   // GPU pointer array D
-        lda,                                     // Leading dimension A (on GPU)
-        ldb,                                     // Leading dimension B (on GPU)
-        ldc,                                     // Leading dimension C (on GPU)
-        ldd,                                     // Leading dimension D (on GPU)
+        lda_gpu,                                 // Precomputed leading dimension A (on GPU)
+        ldb_gpu,                                 // Precomputed leading dimension B (on GPU)
+        ldc_gpu,                                 // Precomputed leading dimension C (on GPU)
+        ldd_gpu,                                 // Precomputed leading dimension D (on GPU)
         problem_sizes_ptr,                       // GPU problem sizes
         splitKSlices,                            // Split-K factor
         alpha,                                   // Alpha scaling factor
@@ -306,9 +247,10 @@ void cuda_graph_splitk_grouped_gemm_template(cutlass::gemm::GemmCoord const* pro
 }
 
 void cuda_graph_splitk_grouped_gemm(cutlass::gemm::GemmCoord const* problem_sizes_ptr, int problem_count,
-    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu,
-    void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, bool isLoraIn, nvinfer1::DataType dataType,
-    int splitKSlices, int minKN, cudaStream_t stream)
+    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu, int64_t const* lda_gpu,
+    int64_t const* ldb_gpu, int64_t const* ldc_gpu, int64_t const* ldd_gpu, void* gemmExecutionWorkspace,
+    int64_t gemmExecutionWorkspaceSize, bool isLoraIn, nvinfer1::DataType dataType, int splitKSlices, int minKN,
+    cudaStream_t stream)
 {
     // Based on splitkGroupGemm.cu logic for kernel selection
     if (dataType == nvinfer1::DataType::kHALF)
@@ -319,26 +261,26 @@ void cuda_graph_splitk_grouped_gemm(cutlass::gemm::GemmCoord const* problem_size
             if (minKN >= 8)
             {
                 cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 8, 4>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
+                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices, stream);
             }
             else if (minKN >= 4)
             {
                 cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 4, 4>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
+                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices, stream);
             }
             else if (minKN >= 2)
             {
                 cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 2, 2>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
+                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices, stream);
             }
             else
             {
                 cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 1, 2>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
+                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices, stream);
             }
         }
         else
@@ -347,26 +289,26 @@ void cuda_graph_splitk_grouped_gemm(cutlass::gemm::GemmCoord const* problem_size
             if (minKN >= 8)
             {
                 cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::half_t, 8, 8, 4>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
+                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices, stream);
             }
             else if (minKN >= 4)
             {
                 cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::half_t, 4, 8, 4>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
+                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices, stream);
             }
             else if (minKN >= 2)
             {
                 cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::half_t, 2, 8, 2>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
+                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices, stream);
             }
             else
             {
                 cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::half_t, 1, 8, 2>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
+                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices, stream);
             }
         }
     }
@@ -378,14 +320,14 @@ void cuda_graph_splitk_grouped_gemm(cutlass::gemm::GemmCoord const* problem_size
             if (minKN >= 8)
             {
                 cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::bfloat16_t, 8, 8, 4>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
+                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices, stream);
             }
             else
             {
                 cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::bfloat16_t, 8, 1, 2>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
+                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices, stream);
             }
         }
         else
@@ -393,14 +335,14 @@ void cuda_graph_splitk_grouped_gemm(cutlass::gemm::GemmCoord const* problem_size
             if (minKN >= 8)
             {
                 cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::bfloat16_t, 8, 8, 4>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
+                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices, stream);
             }
             else
             {
                 cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::bfloat16_t, 1, 8, 2>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, gemmExecutionWorkspace,
-                    gemmExecutionWorkspaceSize, splitKSlices, stream);
+                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
+                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices, stream);
             }
         }
     }

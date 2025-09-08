@@ -1175,17 +1175,15 @@ class PeftCacheManager(BaseResourceManager):
         for req in context_batch:
             self.add_request_peft(req)
 
-        py_lora_task_layer_module_configs = self.impl.ensure_batch(
+        task_id_to_layer_module_configs = self.impl.ensure_batch(
             context_batch, generation_batch, False)
 
+        # Now the C++ ensure_batch returns task_id -> layer-module-configs mapping
+        # We need to set each request's py_lora_task_layer_module_configs based on its task_id
         for req in context_batch:
-            req.py_lora_task_layer_module_configs = py_lora_task_layer_module_configs[
-                req.
-                py_request_id] if req.py_request_id in py_lora_task_layer_module_configs else None
+            req.py_lora_task_layer_module_configs = task_id_to_layer_module_configs
         for req in generation_batch:
-            req.py_lora_task_layer_module_configs = py_lora_task_layer_module_configs[
-                req.
-                py_request_id] if req.py_request_id in py_lora_task_layer_module_configs else None
+            req.py_lora_task_layer_module_configs = task_id_to_layer_module_configs
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass
