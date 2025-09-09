@@ -3,6 +3,8 @@ from typing import Dict, List, Optional
 
 import torch
 
+from ...pyexecutor.cuda_graph_lora_params import CudaGraphLoraParams
+
 
 class LoraModuleType(IntEnum):
     """Enum class representing different types of modules that can have LoRA adapters.
@@ -127,12 +129,15 @@ class LoraLayer(torch.nn.Module):
         Returns:
             LoRA output tensor or None
         """
-        cuda_graph_params = lora_params.get('cuda_graph_params')
+        cuda_graph_params: CudaGraphLoraParams = lora_params.get(
+            'cuda_graph_params')
         if cuda_graph_params is None:
             return None
 
         # Get layer-specific parameters
-        layer_params = cuda_graph_params.get_layer_params(layer_idx)
+        layer_key = CudaGraphLoraParams.LoraLayerKey(
+            layer_idx=layer_idx, module_ids=tuple(self.lora_module_types))
+        layer_params = cuda_graph_params.get_layer_params(layer_key)
 
         # Skip layers that don't have LoRA modules
         if layer_params is None:
@@ -145,8 +150,7 @@ class LoraLayer(torch.nn.Module):
             batch_size, hidden_size = x.shape[0], x.shape[-1]
 
             # Get max_rank from layer configuration and number of modules
-            num_layer_modules = cuda_graph_params.get_layer_module_count(
-                layer_idx)
+            num_layer_modules = len(self.lora_module_types)
             max_rank = cuda_graph_params.max_rank
 
             # Intermediate buffer: [num_layer_modules, batch_size, max_rank]

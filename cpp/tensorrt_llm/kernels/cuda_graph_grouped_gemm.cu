@@ -34,10 +34,9 @@ namespace kernels
  */
 template <int M1, int N1, int K1, int M2, int N2, int K2, typename cutlassType, int kAlignmentAB, int kAlignmentC,
     int kStages>
-void cuda_graph_grouped_gemm_template(cutlass::gemm::GemmCoord const* problem_sizes_ptr, int problem_count,
-    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu, int64_t const* lda_gpu,
-    int64_t const* ldb_gpu, int64_t const* ldc_gpu, int64_t const* ldd_gpu, void* gemmExecutionWorkspace,
-    int64_t gemmExecutionWorkspaceSize, cudaStream_t stream)
+void cuda_graph_grouped_gemm_template(cutlass::gemm::GemmCoord* problem_sizes_ptr, int problem_count, void** ptrA_gpu,
+    void** ptrB_gpu, void** ptrC_gpu, void** ptrD_gpu, int64_t* lda_gpu, int64_t* ldb_gpu, int64_t* ldc_gpu,
+    int64_t* ldd_gpu, void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, cudaStream_t stream)
 {
     using ElementA = cutlassType;
     using ElementB = cutlassType;
@@ -64,10 +63,10 @@ void cuda_graph_grouped_gemm_template(cutlass::gemm::GemmCoord const* problem_si
     typename Gemm::EpilogueOutputOp::Params epilogue_op(alpha, beta);
 
     // Cast pointers to the correct types for CUTLASS
-    auto ptr_A = reinterpret_cast<ElementA* const*>(ptrA_gpu);
-    auto ptr_B = reinterpret_cast<ElementB* const*>(ptrB_gpu);
-    auto ptr_C = reinterpret_cast<ElementOutput* const*>(ptrC_gpu);
-    auto ptr_D = reinterpret_cast<ElementOutput* const*>(ptrD_gpu);
+    auto ptr_A = reinterpret_cast<ElementA**>(ptrA_gpu);
+    auto ptr_B = reinterpret_cast<ElementB**>(ptrB_gpu);
+    auto ptr_C = reinterpret_cast<ElementOutput**>(ptrC_gpu);
+    auto ptr_D = reinterpret_cast<ElementOutput**>(ptrD_gpu);
 
     // Use full workspace for GEMM execution (no leading dimension allocation needed)
     void* gemm_workspace = gemmExecutionWorkspace;
@@ -92,8 +91,7 @@ void cuda_graph_grouped_gemm_template(cutlass::gemm::GemmCoord const* problem_si
         ldb_gpu,                                     // Precomputed leading dimension B (on GPU)
         ldc_gpu,                                     // Precomputed leading dimension C (on GPU)
         ldd_gpu,                                     // Precomputed leading dimension D (on GPU)
-        problem_sizes_ptr                            // Problem sizes for host-side calculations
-    );
+        nullptr);
 
     // Check if arguments are valid
     TLLM_CHECK_WITH_INFO(gemm_op.can_implement(args), "Grouped GEMM cannot be implemented with the given arguments");
@@ -112,10 +110,10 @@ void cuda_graph_grouped_gemm_template(cutlass::gemm::GemmCoord const* problem_si
     TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "Failed to execute grouped GEMM");
 }
 
-void cuda_graph_grouped_gemm(cutlass::gemm::GemmCoord const* problem_sizes_ptr, int problem_count,
-    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu, int64_t const* lda_gpu,
-    int64_t const* ldb_gpu, int64_t const* ldc_gpu, int64_t const* ldd_gpu, void* gemmExecutionWorkspace,
-    int64_t gemmExecutionWorkspaceSize, bool isLoraIn, nvinfer1::DataType dataType, int minKN, cudaStream_t stream)
+void cuda_graph_grouped_gemm(cutlass::gemm::GemmCoord* problem_sizes_ptr, int problem_count, void** ptrA_gpu,
+    void** ptrB_gpu, void** ptrC_gpu, void** ptrD_gpu, int64_t* lda_gpu, int64_t* ldb_gpu, int64_t* ldc_gpu,
+    int64_t* ldd_gpu, void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, bool isLoraIn,
+    nvinfer1::DataType dataType, int minKN, cudaStream_t stream)
 {
     // Based on the original groupGemm.cu logic for kernel selection
     if (dataType == nvinfer1::DataType::kHALF)
@@ -171,10 +169,10 @@ void cuda_graph_grouped_gemm(cutlass::gemm::GemmCoord const* problem_sizes_ptr, 
  */
 template <int M1, int N1, int K1, int M2, int N2, int K2, typename cutlassType, int kAlignmentAB, int kAlignmentC,
     int kStages>
-void cuda_graph_splitk_grouped_gemm_template(cutlass::gemm::GemmCoord const* problem_sizes_ptr, int problem_count,
-    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu, int64_t const* lda_gpu,
-    int64_t const* ldb_gpu, int64_t const* ldc_gpu, int64_t const* ldd_gpu, void* gemmExecutionWorkspace,
-    int64_t gemmExecutionWorkspaceSize, int splitKSlices, cudaStream_t stream)
+void cuda_graph_splitk_grouped_gemm_template(cutlass::gemm::GemmCoord* problem_sizes_ptr, int problem_count,
+    void** ptrA_gpu, void** ptrB_gpu, void** ptrC_gpu, void** ptrD_gpu, int64_t* lda_gpu, int64_t* ldb_gpu,
+    int64_t* ldc_gpu, int64_t* ldd_gpu, void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize,
+    int splitKSlices, cudaStream_t stream)
 {
     using ElementA = cutlassType;
     using ElementB = cutlassType;
@@ -198,12 +196,13 @@ void cuda_graph_splitk_grouped_gemm_template(cutlass::gemm::GemmCoord const* pro
 
     float alpha = 1.0f;
     float beta = 0.0f;
+    typename Gemm::EpilogueOutputOp::Params epilogue_op(alpha, beta);
 
     // Cast pointers to the correct types for CUTLASS
-    auto ptr_A = reinterpret_cast<ElementA* const*>(ptrA_gpu);
-    auto ptr_B = reinterpret_cast<ElementB* const*>(ptrB_gpu);
-    auto ptr_C = reinterpret_cast<ElementOutput* const*>(ptrC_gpu);
-    auto ptr_D = reinterpret_cast<ElementOutput* const*>(ptrD_gpu);
+    auto ptr_A = reinterpret_cast<ElementA**>(ptrA_gpu);
+    auto ptr_B = reinterpret_cast<ElementB**>(ptrB_gpu);
+    auto ptr_C = reinterpret_cast<ElementOutput**>(ptrC_gpu);
+    auto ptr_D = reinterpret_cast<ElementOutput**>(ptrD_gpu);
 
     // Use full workspace for GEMM execution (no leading dimension allocation needed)
     void* gemm_workspace = gemmExecutionWorkspace;
@@ -213,20 +212,21 @@ void cuda_graph_splitk_grouped_gemm_template(cutlass::gemm::GemmCoord const* pro
     Gemm gemm_op;
 
     // Setup arguments for split-K grouped GEMM - using precomputed leading dimensions from GPU tensors
-    typename Gemm::Arguments args(problem_count, // Problem count
-        ptr_A,                                   // GPU pointer array A
-        ptr_B,                                   // GPU pointer array B
-        ptr_C,                                   // GPU pointer array C
-        ptr_D,                                   // GPU pointer array D
-        lda_gpu,                                 // Precomputed leading dimension A (on GPU)
-        ldb_gpu,                                 // Precomputed leading dimension B (on GPU)
-        ldc_gpu,                                 // Precomputed leading dimension C (on GPU)
-        ldd_gpu,                                 // Precomputed leading dimension D (on GPU)
-        problem_sizes_ptr,                       // GPU problem sizes
-        splitKSlices,                            // Split-K factor
-        alpha,                                   // Alpha scaling factor
-        beta                                     // Beta scaling factor
-    );
+    typename Gemm::Arguments args(problem_sizes_ptr, // GPU problem sizes
+        problem_count,                               // Problem count
+        0,                                           // Threadblock count
+        epilogue_op,                                 // Epilogue operation
+        ptr_A,                                       // GPU pointer array A
+        ptr_B,                                       // GPU pointer array B
+        ptr_C,                                       // GPU pointer array C
+        ptr_D,                                       // GPU pointer array D
+        lda_gpu,                                     // Precomputed leading dimension A (on GPU)
+        ldb_gpu,                                     // Precomputed leading dimension B (on GPU)
+        ldc_gpu,                                     // Precomputed leading dimension C (on GPU)
+        ldd_gpu,                                     // Precomputed leading dimension D (on GPU)
+        nullptr,                                     // Host problem sizes
+        splitKSlices,                                // Split-K factor
+        nullptr);
 
     // Check if arguments are valid
     TLLM_CHECK_WITH_INFO(
@@ -246,11 +246,10 @@ void cuda_graph_splitk_grouped_gemm_template(cutlass::gemm::GemmCoord const* pro
     TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "Failed to execute split-K grouped GEMM");
 }
 
-void cuda_graph_splitk_grouped_gemm(cutlass::gemm::GemmCoord const* problem_sizes_ptr, int problem_count,
-    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu, int64_t const* lda_gpu,
-    int64_t const* ldb_gpu, int64_t const* ldc_gpu, int64_t const* ldd_gpu, void* gemmExecutionWorkspace,
-    int64_t gemmExecutionWorkspaceSize, bool isLoraIn, nvinfer1::DataType dataType, int splitKSlices, int minKN,
-    cudaStream_t stream)
+void cuda_graph_splitk_grouped_gemm(cutlass::gemm::GemmCoord* problem_sizes_ptr, int problem_count, void** ptrA_gpu,
+    void** ptrB_gpu, void** ptrC_gpu, void** ptrD_gpu, int64_t* lda_gpu, int64_t* ldb_gpu, int64_t* ldc_gpu,
+    int64_t* ldd_gpu, void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, bool isLoraIn,
+    nvinfer1::DataType dataType, int splitKSlices, int minKN, cudaStream_t stream)
 {
     // Based on splitkGroupGemm.cu logic for kernel selection
     if (dataType == nvinfer1::DataType::kHALF)

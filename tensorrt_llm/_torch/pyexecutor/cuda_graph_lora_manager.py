@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 
+from ..peft.lora.layer import LoraLayer
 from .adapter_slot_manager import AdapterSlotManager
 from .cuda_graph_lora_params import CudaGraphLoraParams
 
@@ -29,24 +30,23 @@ class CudaGraphLoraManager:
     """
 
     def __init__(self,
-                 num_layers: int,
                  max_lora_size: int,
                  max_batch_size: int,
                  max_lora_rank: int,
                  hidden_size: int,
+                 model: torch.nn.Module,
                  device: str = "cuda"):
         """
         Initialize the CUDA Graph LoRA manager.
 
         Args:
-            num_layers: Number of model layers
             max_lora_size: Maximum number of LoRA adapters that can be active
             max_batch_size: Maximum batch size for CUDA graphs
             max_lora_rank: Maximum LoRA rank across all layers
             hidden_size: Hidden dimension size of the model
+            model: Model to get layerwise LoRA info
             device: Device to allocate tensors on
         """
-        self.num_layers = num_layers
         self.max_lora_size = max_lora_size
         self.max_batch_size = max_batch_size
         self.max_lora_rank = max_lora_rank
@@ -59,6 +59,56 @@ class CudaGraphLoraManager:
         # Will be initialized lazily when we have access to peft_table
         self.cuda_graph_lora_params: Optional[CudaGraphLoraParams] = None
         self._is_initialized = False
+        self.layer_info: Dict[CudaGraphLoraParams.LoraLayerKey,
+                              CudaGraphLoraParams.LoraLayerInfo] | None = None
+        self._initialize_from_model(model)
+
+    def _initialize_from_model(self, model: torch.nn.Module):
+        """
+        Initialize LoRALayerInfo from model.
+        """
+        self.layer_info = dict()
+
+        def get_layer_idx(model: torch.nn.Module, lora_module: LoraLayer,
+                          lora_module_name: str):
+            module = lora_module
+            name = lora_module_name
+            while module is not None and ((not hasattr(module, 'layer_idx'))
+                                          or module.layer_idx is None):
+                name = name.rsplit(".", 1)
+                name = name[0] if len(name) > 1 else None
+                if name is not None:
+                    module = model.get_submodule(name)
+                else:
+                    module = None
+            if hasattr(module, 'layer_idx') and module.layer_idx is not None:
+                return module.layer_idx
+            return None
+
+        '''
+        debug_info = []
+        for name, module in model.named_modules():
+            if isinstance(module, LoraLayer):
+                layer_idx = get_layer_idx(model, module, name)
+                layer_key = CudaGraphLoraParams.LoraLayerKey(layer_idx=layer_idx, module_ids=tuple(module.lora_module_types))
+                debug_info.append(layer_key)
+        debug_info.sort()
+        logger.info(f"Layer info: \n{pprint.pformat(debug_info)}\n")
+        '''
+
+        for name, module in model.named_modules():
+            if isinstance(module, LoraLayer):
+                layer_idx = get_layer_idx(model, module, name)
+                layer_key = CudaGraphLoraParams.LoraLayerKey(
+                    layer_idx=layer_idx,
+                    module_ids=tuple(module.lora_module_types))
+                assert layer_key not in self.layer_info, f"Layer {layer_key} already exists"
+
+                self.layer_info[layer_key] = CudaGraphLoraParams.LoraLayerInfo()
+                self.layer_info[
+                    layer_key].output_sizes = module.output_hidden_sizes
+                self.layer_info[layer_key].module_num = len(
+                    module.lora_module_types)
 
     def _initialize_from_peft_table(self, peft_table: "PeftTable"):
         """
@@ -73,12 +123,6 @@ class CudaGraphLoraManager:
         if self._is_initialized:
             return
 
-        # Find the first non-empty slot to get layer configuration
-        layer_module_nums = []
-        max_ranks = []
-        output_sizes = []
-        input_hidden_sizes = []
-
         # Get configuration from the first available task
         sample_task_id = None
         for task_id, configs in peft_table.items():
@@ -86,72 +130,63 @@ class CudaGraphLoraManager:
                 sample_task_id = task_id
                 break
 
-        if sample_task_id is None:
-            # Fallback to default configuration if no tasks available
-            layer_module_nums = [
-                0
-            ] * self.num_layers  # Assume 1 module per layer
-            max_ranks = [self.max_lora_rank] * self.num_layers
-            output_sizes = [[self.hidden_size]] * self.num_layers
-            input_hidden_sizes = [self.hidden_size] * self.num_layers
-        else:
+        layer_module2key = None
+        if sample_task_id is not None:
             # Extract actual configuration from sample task
             configs = peft_table[sample_task_id]
 
-            # Group by layer to count modules per layer
-            layer_to_modules = {}
+            layer_module2key = dict()
+            for key, info in self.layer_info.items():
+                layer_id = key.layer_idx
+                module_ids = key.module_ids
+                for module_id in module_ids:
+                    layer_module2key[(layer_id, module_id)] = key
+            '''
+            debug_info = dict()
+            for layer_idx, modules in layer_to_modules.items():
+                debug_info[layer_idx] = {
+                    'module_ids': [m.module_id for m in modules],
+                    'in_sizes': [m.in_size for m in modules],
+                    'out_sizes': [m.out_size for m in modules],
+                    'ranks': [m.adapter_size for m in modules],
+                }
+            logger.info(f"Layer to modules: \n{pprint.pformat(debug_info)}\n")
+            debug_info = []
             for config in configs:
                 layer_idx = config.layer_id
-                if layer_idx not in layer_to_modules:
-                    layer_to_modules[layer_idx] = []
-                layer_to_modules[layer_idx].append(config)
-            for layer_idx, modules in layer_to_modules.items():
-                modules.sort(
-                    key=lambda x: x.module_id)  # TODO: work around for now
+                module_id = config.module_id
+                key = layer_module2key[(layer_idx, module_id)]
+                info = self.layer_info[key]
+                debug_info.append(f'layer_idx: {layer_idx}, module_id: {module_id}, key: {key}, info_output_size: {info.output_sizes}; info_output_sizes[{key.module_ids.index(module_id)}]: {info.output_sizes[key.module_ids.index(module_id)]}; config_out_size: {config.out_size}, config_adapter_size: {config.adapter_size}, config_in_size: {config.in_size}')
+            debug_info.sort()
+            logger.info(f"Layer to modules: \n{pprint.pformat(debug_info)}\n")
+            '''
 
-            # Build layer configuration arrays
-            for layer_idx in range(self.num_layers):
-                if layer_idx in layer_to_modules:
-                    modules = layer_to_modules[layer_idx]
-                    layer_module_nums.append(len(modules))
-
-                    # Validate ranks and get maximum rank for this layer
-                    layer_ranks = []
-                    for config in modules:
-                        # TaskLayerModuleConfig uses 'rank' attribute, not 'lora_rank'
-                        rank = config.adapter_size
-                        if rank > self.max_lora_rank:
-                            raise ValueError(
-                                f"LoRA rank {rank} in layer {layer_idx} exceeds max_lora_rank {self.max_lora_rank}. "
-                                f"Please increase max_lora_rank in LoraConfig or reduce the LoRA rank."
-                            )
-                        layer_ranks.append(rank)
-
-                    layer_max_rank = max(layer_ranks)
-                    max_ranks.append(layer_max_rank)
-                    # Get output sizes for each module - TaskLayerModuleConfig uses 'out_dim'
-                    module_output_sizes = [
-                        config.out_size for config in modules
-                    ]
-                    output_sizes.append(module_output_sizes)
-                    input_hidden_sizes.append(modules[0].in_size)
+            for config in configs:
+                layer_idx = config.layer_id
+                module_id = config.module_id
+                key = layer_module2key[(layer_idx, module_id)]
+                info = self.layer_info[key]
+                in_size = config.in_size // 16  # TODO: other dtype
+                out_size = config.out_size // 16  # TODO: other dtype
+                if info.input_hidden_size == 0:
+                    info.input_hidden_size = in_size
                 else:
-                    # Layer has no LoRA modules
-                    layer_module_nums.append(0)
-                    max_ranks.append(0)
-                    output_sizes.append([])
-                    input_hidden_sizes.append(0)
+                    assert info.input_hidden_size == in_size, f"Layer {key} has modules with different input sizes, old input size is {info.input_hidden_size}, new input size is {in_size}"
+                assert info.output_sizes[key.module_ids.index(
+                    module_id
+                )] == out_size, f"LayerKey {key} has modules with different output sizes"
+                assert config.adapter_size <= self.max_lora_rank, f"Layer {layer_idx}, module {module_id} has rank {config.adapter_size} which is greater than max_lora_rank {self.max_lora_rank}"
+                # TODO: check if all modules in key present in configs
 
+        # logger.info(f"Layer info: \n{str(self.layer_info)}\n")
         # Create the single CudaGraphLoraParams instance
         self.cuda_graph_lora_params = CudaGraphLoraParams(
-            num_layers=self.num_layers,
             max_batch_size=self.max_batch_size,
             max_lora_size=self.max_lora_size,
-            layer_module_nums=layer_module_nums,
-            max_ranks=max_ranks,
             max_rank=self.max_lora_rank,
-            output_sizes=output_sizes,
-            input_hidden_sizes=input_hidden_sizes,
+            layer_info=self.layer_info,
+            layer_module2key=layer_module2key,
             device=self.device)
 
         self._is_initialized = True
@@ -232,13 +267,8 @@ class CudaGraphLoraManager:
             self.adapter_slot_manager.reset_changed_flag()
 
         # Update GEMM sizes and offsets based on current batch
-        # Get input hidden size from attention metadata if available
-        input_hidden_size = getattr(attn_metadata, 'hidden_size',
-                                    4096)  # Default fallback
-
         cuda_graph_lora_params.update_gemm_sizes_and_offsets(
             batch_size=batch_size,
-            input_hidden_size=input_hidden_size,
             slot_counts=slot_counts,
             slot_to_task_mapping=slot_to_task_mapping,
             peft_table=peft_table)
