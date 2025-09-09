@@ -492,31 +492,25 @@ class PyTorchModelEngine(ModelEngine):
 
     def _init_cuda_graph_lora_manager(self, lora_config: LoraConfig):
         """Initialize CUDA Graph LoRA manager with model configuration."""
-        try:
-            # Get model configuration
-            model_config = self.model.config
-            num_layers = model_config.num_hidden_layers
-            max_lora_size = lora_config.max_loras or 8  # Default fallback
-            max_batch_size = self.batch_size  # Use engine's max batch size
+        # Get model configuration
+        model_config = self.model.config
+        max_lora_size = lora_config.max_loras or 8  # Default fallback
+        max_batch_size = self.batch_size  # Use engine's max batch size
 
-            # Defer layer module configuration until we have access to actual peft_table
-            # This avoids incorrect assumptions about uniform layer structure
-            self.cuda_graph_lora_manager = CudaGraphLoraManager(
-                num_layers=num_layers,
-                max_lora_size=max_lora_size,
-                max_batch_size=max_batch_size,
-                max_lora_rank=lora_config.max_lora_rank,
-                hidden_size=model_config.hidden_size,
-                device='cuda')
+        # Defer layer module configuration until we have access to actual peft_table
+        # This avoids incorrect assumptions about uniform layer structure
+        self.cuda_graph_lora_manager = CudaGraphLoraManager(
+            max_lora_size=max_lora_size,
+            max_batch_size=max_batch_size,
+            max_lora_rank=lora_config.max_lora_rank,
+            hidden_size=model_config.hidden_size,
+            model=self.model,
+            device='cuda')
 
-            logger.info(
-                f"Initialized CUDA Graph LoRA manager with {num_layers} layers, "
-                f"max {max_lora_size} adapters, max rank {lora_config.max_lora_rank}"
-            )
-
-        except Exception as e:
-            logger.warning(f"Failed to initialize CUDA Graph LoRA manager: {e}")
-            self.cuda_graph_lora_manager = None
+        logger.info(
+            f"Initialized CUDA Graph LoRA manager, "
+            f"max {max_lora_size} adapters, max rank {lora_config.max_lora_rank}"
+        )
 
     def set_guided_decoder(self,
                            guided_decoder: CapturableGuidedDecoder) -> bool:
@@ -2153,11 +2147,13 @@ class PyTorchModelEngine(ModelEngine):
         if use_cuda_graph_mode:
             # Get PEFT table from resource manager if available
             try:
+                '''
                 peft_cache_manager = getattr(self, '_peft_cache_manager', None)
                 if peft_cache_manager is None:
                     # Fallback to legacy mode if PEFT cache manager not available
                     return self._get_legacy_lora_params_from_requests(
                         scheduled_requests, attn_metadata)
+                '''
 
                 # Get PEFT table from request's py_lora_task_layer_module_configs
                 # Since all requests with the same task_id have the same layer-module-configs,

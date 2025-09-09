@@ -44,10 +44,10 @@ namespace kernels
  * @param minKN Minimum K*N value for kernel selection
  * @param stream CUDA stream
  */
-void cuda_graph_grouped_gemm(cutlass::gemm::GemmCoord const* problem_sizes_ptr, int problem_count,
-    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu, int64_t const* lda_gpu,
-    int64_t const* ldb_gpu, int64_t const* ldc_gpu, int64_t const* ldd_gpu, void* gemmExecutionWorkspace,
-    int64_t gemmExecutionWorkspaceSize, bool isLoraIn, nvinfer1::DataType dataType, int minKN, cudaStream_t stream);
+void cuda_graph_grouped_gemm(cutlass::gemm::GemmCoord* problem_sizes_ptr, int problem_count, void** ptrA_gpu,
+    void** ptrB_gpu, void** ptrC_gpu, void** ptrD_gpu, int64_t* lda_gpu, int64_t* ldb_gpu, int64_t* ldc_gpu,
+    int64_t* ldd_gpu, void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, bool isLoraIn,
+    nvinfer1::DataType dataType, int minKN, cudaStream_t stream);
 
 /**
  * @brief CUDA Graph compatible wrapper for split-K grouped GEMM operations.
@@ -55,11 +55,10 @@ void cuda_graph_grouped_gemm(cutlass::gemm::GemmCoord const* problem_sizes_ptr, 
  * Similar to cuda_graph_grouped_gemm but uses split-K algorithm for better
  * performance with certain problem sizes. No parameter workspace needed.
  */
-void cuda_graph_splitk_grouped_gemm(cutlass::gemm::GemmCoord const* problem_sizes_ptr, int problem_count,
-    void* const* ptrA_gpu, void* const* ptrB_gpu, void* const* ptrC_gpu, void* const* ptrD_gpu, int64_t const* lda_gpu,
-    int64_t const* ldb_gpu, int64_t const* ldc_gpu, int64_t const* ldd_gpu, void* gemmExecutionWorkspace,
-    int64_t gemmExecutionWorkspaceSize, bool isLoraIn, nvinfer1::DataType dataType, int splitKSlices, int minKN,
-    cudaStream_t stream);
+void cuda_graph_splitk_grouped_gemm(cutlass::gemm::GemmCoord* problem_sizes_ptr, int problem_count, void** ptrA_gpu,
+    void** ptrB_gpu, void** ptrC_gpu, void** ptrD_gpu, int64_t* lda_gpu, int64_t* ldb_gpu, int64_t* ldc_gpu,
+    int64_t* ldd_gpu, void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, bool isLoraIn,
+    nvinfer1::DataType dataType, int splitKSlices, int minKN, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

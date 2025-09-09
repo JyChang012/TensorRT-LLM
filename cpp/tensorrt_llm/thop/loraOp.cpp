@@ -228,33 +228,34 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
 
     // GPU pointers are now ready for direct use with CUDA Graph compatible GEMM functions
 
-    // Convert flattened pointer tensors to GPU pointer arrays for CUDA Graph compatible access
-    auto* a_ptrs_gpu = reinterpret_cast<void* const*>(a_ptrs_flat.data_ptr());
-    auto* d_ptrs_gpu = reinterpret_cast<void* const*>(d_ptrs_flat.data_ptr());
-    auto* a_prime_ptrs_gpu = reinterpret_cast<void* const*>(a_prime_ptrs_flat.data_ptr());
-    auto* d_prime_ptrs_gpu = reinterpret_cast<void* const*>(d_prime_ptrs_flat.data_ptr());
+    // Convert flattened pointer tensors to GPU pointer arrays for CUDA Graph compatible access (remove const for
+    // CUTLASS)
+    auto* a_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(a_ptrs_flat.data_ptr()));
+    auto* d_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(d_ptrs_flat.data_ptr()));
+    auto* a_prime_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(a_prime_ptrs_flat.data_ptr()));
+    auto* d_prime_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(d_prime_ptrs_flat.data_ptr()));
 
     // Step 3: Prepare GEMM problem sizes using CUDA Graph compatible operations
     // The lora_in_sizes and lora_out_sizes tensors are already in cutlass::gemm::GemmCoord format
     // (3 int32 values: m, n, k) and can be cast directly to the required pointer type
 
     // Get GPU pointers to problem sizes tensors - these are stored in the correct format
-    auto* problem_sizes_1_ptr = reinterpret_cast<cutlass::gemm::GemmCoord const*>(lora_in_sizes.data_ptr());
-    auto* problem_sizes_2_ptr = reinterpret_cast<cutlass::gemm::GemmCoord const*>(lora_out_sizes.data_ptr());
+    auto* problem_sizes_1_ptr = reinterpret_cast<cutlass::gemm::GemmCoord*>(lora_in_sizes.data_ptr());
+    auto* problem_sizes_2_ptr = reinterpret_cast<cutlass::gemm::GemmCoord*>(lora_out_sizes.data_ptr());
 
     // Step 4: Get weight pointers using CUDA Graph compatible operations
     // The b_ptrs and b_prime_ptrs tensors already contain pointer values as int64
-    // Cast them directly to void* arrays for the GEMM kernels
+    // Cast them directly to void* arrays for the GEMM kernels (remove const for CUTLASS compatibility)
 
-    auto* b_ptrs_gpu = reinterpret_cast<void* const*>(b_ptrs.data_ptr());
-    auto* b_prime_ptrs_gpu = reinterpret_cast<void* const*>(b_prime_ptrs.data_ptr());
+    auto* b_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(b_ptrs.data_ptr()));
+    auto* b_prime_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(b_prime_ptrs.data_ptr()));
 
-    // Step 4.5: Get precomputed leading dimension pointers for GEMM operations
-    auto* lda_gpu = reinterpret_cast<int64_t const*>(lda.data_ptr());
-    auto* ldb_gpu = reinterpret_cast<int64_t const*>(ldb.data_ptr());
-    auto* ldd_gpu = reinterpret_cast<int64_t const*>(ldd.data_ptr());
-    auto* ldb_prime_gpu = reinterpret_cast<int64_t const*>(ldb_prime.data_ptr());
-    auto* ldd_prime_gpu = reinterpret_cast<int64_t const*>(ldd_prime.data_ptr());
+    // Step 4.5: Get precomputed leading dimension pointers for GEMM operations (remove const for CUTLASS compatibility)
+    auto* lda_gpu = reinterpret_cast<int64_t*>(const_cast<void*>(lda.data_ptr()));
+    auto* ldb_gpu = reinterpret_cast<int64_t*>(const_cast<void*>(ldb.data_ptr()));
+    auto* ldd_gpu = reinterpret_cast<int64_t*>(const_cast<void*>(ldd.data_ptr()));
+    auto* ldb_prime_gpu = reinterpret_cast<int64_t*>(const_cast<void*>(ldb_prime.data_ptr()));
+    auto* ldd_prime_gpu = reinterpret_cast<int64_t*>(const_cast<void*>(ldd_prime.data_ptr()));
 
     // Step 5: Direct CUTLASS grouped GEMM setup (no CuBLAS wrapper needed)
     // The new CUDA Graph compatible implementation uses CUTLASS directly
@@ -284,7 +285,7 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
             execution_workspace_size,
             true,                                           // isLoraIn
             loraRuntimeDataType,
-            4,                                              // splitKSlices
+            16,                                             // splitKSlices
             1,                                              // minKN
             stream);
     }

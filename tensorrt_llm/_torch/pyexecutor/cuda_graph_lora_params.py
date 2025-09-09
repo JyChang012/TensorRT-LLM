@@ -5,8 +5,9 @@ This module defines the new LoRA parameters structure that enables CUDA Graph ca
 with multi-LoRA by using persistent device tensors for group GEMM operations.
 """
 
+from collections import namedtuple
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -72,49 +73,42 @@ class CudaGraphLoraParams:
     of CUDA Graph replay to support different LoRA combinations per batch.
     """
 
+    LoraLayerKey = namedtuple('LoraLayerKey', ['layer_idx', 'module_ids'])
+
+    @dataclass
+    class LoraLayerInfo:
+        module_num: int = 0
+        output_sizes: List[int] | torch.Tensor | None = None
+        input_hidden_size: int = 0
+
     def __init__(self,
-                 num_layers: int,
                  max_batch_size: int,
                  max_lora_size: int,
-                 layer_module_nums: List[int],
-                 max_ranks: List[int],
                  max_rank: int,
-                 output_sizes: List[List[int]],
-                 input_hidden_sizes: List[int],
-                 device: str = "cuda",
-                 dtype: torch.dtype = torch.int32):
+                 layer_info: Dict[LoraLayerKey, LoraLayerInfo],
+                 layer_module2key: Dict[tuple[int, int], LoraLayerKey],
+                 device: str = "cuda"):
         """
         Initialize CUDA Graph compatible LoRA parameters.
 
         Args:
-            num_layers: Number of model layers
             max_batch_size: Maximum batch size for this graph
             max_lora_size: Maximum number of LoRA adapters
-            layer_module_nums: Number of modules per layer (e.g., [3, 3, ...] for q,k,v per layer)
-            max_ranks: Maximum rank for each layer
             max_rank: Maximum rank for all layers
-            output_sizes: Output sizes for each module in each layer
-            input_hidden_sizes: Input hidden sizes for each layer
+            layers_info: Layer information for each layer
             device: Device to allocate tensors on
             dtype: Data type for size and offset tensors
         """
-        self.num_layers = num_layers
         self.max_batch_size = max_batch_size
         self.max_lora_size = max_lora_size
         self.max_rank = max_rank
-        self.layer_module_nums = layer_module_nums
+        self.layer_info = layer_info
+        self.layer_module2key = layer_module2key
         self.device = device
-        self.dtype = dtype
 
         # Sparse per-layer parameters (only for layers with LoRA modules)
         # Map: layer_idx -> LoraLayerParams (only contains layers with layer_module_nums[layer_idx] > 0)
-        self.layer_params: Dict[int, LoraLayerParams] = {}
-
-        # Store layer configurations for quick access
-        self.active_layer_indices: List[int] = [
-        ]  # Indices of layers with LoRA modules
-        self.layer_info: Dict[int, Dict[str, Any]] = {
-        }  # layer_idx -> {module_num, max_rank, output_sizes}
+        self.layer_params: Dict[LoraLayerKey, LoraLayerParams] = {}
 
         # Global slot assignment for the batch
         # Shape: [max_batch_size], values in [0, max_lora_size] where max_lora_size is for base model
@@ -129,39 +123,28 @@ class CudaGraphLoraParams:
                                       dtype=torch.int64,
                                       device=device)
 
+        # persistent values for gen-only batch with cuda graph
+        self.persistent_sorted_ids = self.sorted_ids
+
         # Initialize per-layer parameters ONLY for layers with LoRA modules
-        for layer_idx in range(num_layers):
-            layer_module_num = layer_module_nums[layer_idx]
-            if layer_module_num > 0:  # Only create params for layers with LoRA modules
-                max_rank = max_ranks[layer_idx]
-                output_size = output_sizes[layer_idx] if layer_idx < len(
-                    output_sizes) else []
-                input_hidden_size = input_hidden_sizes[
-                    layer_idx] if layer_idx < len(input_hidden_sizes) else 0
+        for key, info in self.layer_info.items():
+            assert info.module_num > 0 and info.output_sizes is not None and len(
+                info.output_sizes
+            ) == info.module_num and info.input_hidden_size >= 0
+            info.output_sizes = torch.tensor(info.output_sizes)
+            # Create layer parameters
+            self.layer_params[key] = self._create_layer_params(
+                key, info.module_num, info.output_sizes)
 
-                # Store layer information
-                self.active_layer_indices.append(layer_idx)
-                self.layer_info[layer_idx] = {
-                    'module_num': layer_module_num,
-                    'max_rank': max_rank,
-                    'output_sizes': torch.tensor(output_size),
-                    'input_hidden_size': input_hidden_size
-                }
-
-                # Create layer parameters
-                self.layer_params[layer_idx] = self._create_layer_params(
-                    layer_idx, layer_module_num, max_rank, output_size)
-
-    def _create_layer_params(self, layer_idx: int, layer_module_num: int,
-                             max_rank: int,
-                             module_output_sizes: List[int]) -> LoraLayerParams:
+    def _create_layer_params(
+            self, key: LoraLayerKey, layer_module_num: int,
+            module_output_sizes: torch.Tensor) -> LoraLayerParams:
         """
         Create LoraLayerParams for a specific layer.
 
         Args:
-            layer_idx: Index of the layer
+            key: Key of the layer
             layer_module_num: Number of modules in this layer
-            max_rank: Maximum rank for this layer
             module_output_sizes: Output sizes for each module in this layer
 
         Returns:
@@ -225,29 +208,22 @@ class CudaGraphLoraParams:
         assert actual_batch_size <= self.max_batch_size, \
             f"Actual batch size {actual_batch_size} exceeds max {self.max_batch_size}"
 
-        # Update slot_ids tensor (values can be 0 to max_lora_size, where max_lora_size = base model)
-        self.slot_ids[:actual_batch_size] = torch.tensor(
-            slot_ids[:actual_batch_size], dtype=torch.int32, device=self.device)
-
-        # Zero out unused positions (use 0 as default, which is a valid LoRA slot)
-        if actual_batch_size < self.max_batch_size:
-            self.slot_ids[actual_batch_size:] = 0
+        slot_ids = slot_ids[:actual_batch_size]
+        slot_ids = torch.tensor(slot_ids,
+                                dtype=self.persistent_sorted_ids.dtype)
 
         # Compute sorted indices for gather/scatter operations
         # Use stable sort to maintain deterministic ordering for tokens with same slot_id
-        _, sorted_indices = torch.sort(self.slot_ids[:actual_batch_size],
-                                       stable=True)
+        _, sorted_indices = torch.sort(slot_ids, stable=True)
 
         # Update sorted_ids tensor with the computed indices
-        self.sorted_ids[:actual_batch_size] = sorted_indices
-
-        # Fill remaining positions with sequential indices (won't be used but maintains valid indices)
-        if actual_batch_size < self.max_batch_size:
-            self.sorted_ids[actual_batch_size:] = torch.arange(
-                actual_batch_size,
-                self.max_batch_size,
-                dtype=torch.int64,
-                device=self.device)
+        if actual_batch_size <= self.max_batch_size:
+            # if can fit in persistent, use it
+            self.sorted_ids = self.persistent_sorted_ids
+            self.sorted_ids[:actual_batch_size] = sorted_indices
+        else:
+            # otherwise not an gen-only batch, use new allocated sorted_ids
+            self.sorted_ids = sorted_indices.to(device=self.device)
 
     def update_weight_pointers(self, peft_table: Dict[int, List],
                                slot_to_task_mapping: Dict[int, Optional[int]]):
@@ -260,12 +236,11 @@ class CudaGraphLoraParams:
         """
         host_weight_in_ptrs = dict()
         host_weight_out_ptrs = dict()
-        for layer_idx in self.active_layer_indices:
-            layer_params = self.layer_params[layer_idx]
-            host_weight_in_ptrs[layer_idx] = torch.zeros_like(
-                layer_params.d_b_ptrs, device='cpu')
-            host_weight_out_ptrs[layer_idx] = torch.zeros_like(
-                layer_params.d_b_prime_ptrs, device='cpu')
+        for layer_key, layer_param in self.layer_params.items():
+            host_weight_in_ptrs[layer_key] = torch.zeros_like(
+                layer_param.d_b_ptrs, device='cpu')
+            host_weight_out_ptrs[layer_key] = torch.zeros_like(
+                layer_param.d_b_prime_ptrs, device='cpu')
 
         # Fill in pointers for active slots
         for slot_id, task_id in slot_to_task_mapping.items():
@@ -279,29 +254,30 @@ class CudaGraphLoraParams:
             for config in task_configs:
                 layer_id = config.layer_id
                 module_id = config.module_id
+                key = self.layer_module2key[(layer_id, module_id)]
+                local_module_id = key.module_ids.index(module_id)
 
                 # Only process layers that have LoRA modules
-                assert layer_id in self.layer_params, f"Layer {layer_id} not found in layer_params, assumption that all LoRA has their adapters on the same layers is broken"
-                layer_params = self.layer_params[layer_id]
+                assert key in self.layer_params, f"Layer {layer_id} not found in layer_params, assumption that all LoRA has their adapters on the same layers is broken"
 
                 # Validate LoRA rank - TaskLayerModuleConfig uses 'rank' attribute
                 rank = config.adapter_size
                 assert rank <= self.max_rank, f"LoRA rank {rank} in layer {layer_id} exceeds configured max_rank {self.max_rank}. "
 
                 # Set weight pointers for this slot and module
-                host_weight_in_ptrs[layer_id][
-                    module_id, slot_id] = config.weights_in_pointer
-                host_weight_out_ptrs[layer_id][
-                    module_id, slot_id] = config.weights_out_pointer
+                host_weight_in_ptrs[key][local_module_id,
+                                         slot_id] = config.weights_in_pointer
+                host_weight_out_ptrs[key][local_module_id,
+                                          slot_id] = config.weights_out_pointer
 
-        for layer_idx, layer_param in self.layer_params.items():
-            layer_param.d_b_ptrs.copy_(host_weight_in_ptrs[layer_idx])
-            layer_param.d_b_prime_ptrs.copy_(host_weight_out_ptrs[layer_idx])
+        for key, layer_param in self.layer_params.items():
+            layer_param.d_b_ptrs.copy_(host_weight_in_ptrs[key])
+            layer_param.d_b_prime_ptrs.copy_(host_weight_out_ptrs[key])
 
         # compute ld's
-        for layer_idx, layer_param in self.layer_params.items():
+        for key, layer_param in self.layer_params.items():
             # a [bs, hidden]
-            input_hidden_size = self.layer_info[layer_idx]['input_hidden_size']
+            input_hidden_size = self.layer_info[key].input_hidden_size
             layer_param.d_ld_a.fill_(input_hidden_size)
 
             # a_prime / d [num_layer_modules, bs, max_rank]
@@ -313,10 +289,9 @@ class CudaGraphLoraParams:
 
             # d_prime [bs, sum_of_each_module_output_sizes]
             layer_param.d_ld_d_prime.fill_(
-                torch.sum(self.layer_info[layer_idx]['output_sizes']))
+                torch.sum(self.layer_info[key].output_sizes))
 
     def update_gemm_sizes_and_offsets(self, batch_size: int,
-                                      input_hidden_size: int,
                                       slot_counts: torch.Tensor,
                                       slot_to_task_mapping: Dict[int,
                                                                  Optional[int]],
@@ -326,7 +301,6 @@ class CudaGraphLoraParams:
 
         Args:
             batch_size: Current batch size
-            input_hidden_size: Hidden size of input tensors
             slot_counts: Number of tokens for each slot_id in the batch, shape: [max_lora_size,]
             slot_to_task_mapping: Mapping from slot_id to task_id
             peft_table: PEFT table containing adapter configurations
@@ -339,7 +313,8 @@ class CudaGraphLoraParams:
             return offset
 
         slot_token_offset = get_offset_from_counts(slot_counts)
-        assert slot_token_offset.shape == (self.max_lora_size, )
+        assert slot_token_offset.ndim == 1 and slot_token_offset.shape[
+            0] == self.max_lora_size
 
         # get slot ranks
         # assume ranks are the same within a slot,
@@ -356,7 +331,7 @@ class CudaGraphLoraParams:
             ranks[slot_id] = config.adapter_size
 
         # offset shapes [num_layer_modules, max_lora_size]
-        for layer_idx, layer_params in self.layer_params.items():
+        for layer_key, layer_params in self.layer_params.items():
             # reordered a [bs, hidden], each module has the same offset
             dst_shape = layer_params.d_a_offset.shape
             layer_params.d_a_offset.copy_(
@@ -370,7 +345,7 @@ class CudaGraphLoraParams:
 
             # d' [bs, sum_of_each_module_output_sizes]
             bs_offset = slot_token_offset.unsqueeze(0)  # [1, max_lora_size]
-            out_sizes = self.layer_info[layer_idx]['output_sizes']
+            out_sizes = self.layer_info[layer_key].output_sizes
             sum_out_sizes = torch.sum(out_sizes)
             bs_offset *= sum_out_sizes
 
@@ -380,8 +355,8 @@ class CudaGraphLoraParams:
             layer_params.d_d_prime_offset.copy_(bs_offset + out_offset)
 
             # sizes
-            input_hidden_size = torch.IntTensor(
-                self.layer_info[layer_idx]['input_hidden_size']).reshape(
+            input_hidden_size = torch.tensor(
+                self.layer_info[layer_key].input_hidden_size).reshape(
                     (1,
                      1)).expand(dst_shape)  # [num_layer_modules, max_lora_size]
             input_hidden_size = input_hidden_size.unsqueeze(-1)
@@ -394,7 +369,7 @@ class CudaGraphLoraParams:
                 dst_shape)  # [num_layer_modules, max_lora_size]
             _ranks = _ranks.unsqueeze(-1)
 
-            output_sizes = self.layer_info[layer_idx]['output_sizes'].unsqueeze(
+            output_sizes = self.layer_info[layer_key].output_sizes.unsqueeze(
                 1).expand(dst_shape)  # [num_layer_modules, max_lora_size]
             output_sizes = output_sizes.unsqueeze(-1)
 
@@ -411,65 +386,31 @@ class CudaGraphLoraParams:
 
             # TODO: store only one of this
 
-    def get_problem_count(self, layer_idx: int) -> int:
+    def get_problem_count(self, layer_key: LoraLayerKey) -> int:
         """
         Get the number of GEMM problems for a layer.
 
         Args:
-            layer_idx: Index of the layer
+            layer_key: Key of the layer
 
         Returns:
             Number of GEMM problems (layer_module_num * max_lora_size)
             Returns 0 if layer has no LoRA modules
             Note: Only actual LoRA slots are counted, not the dummy base model slot
         """
-        if layer_idx not in self.layer_params:
+        if layer_key not in self.layer_params:
             return 0  # Layer has no LoRA modules
-        return self.layer_info[layer_idx]['module_num'] * self.max_lora_size
+        return self.layer_info[layer_key].module_num * self.max_lora_size
 
-    def get_layer_params(self, layer_idx: int) -> Optional[LoraLayerParams]:
+    def get_layer_params(self,
+                         layer_key: LoraLayerKey) -> Optional[LoraLayerParams]:
         """
         Get LoRA parameters for a specific layer.
 
         Args:
-            layer_idx: Index of the layer
+            layer_key: Key of the layer
 
         Returns:
             LoraLayerParams for the specified layer, or None if layer has no LoRA modules
         """
-        return self.layer_params.get(layer_idx)
-
-    def has_lora_modules(self, layer_idx: int) -> bool:
-        """
-        Check if a layer has LoRA modules.
-
-        Args:
-            layer_idx: Index of the layer
-
-        Returns:
-            True if the layer has LoRA modules, False otherwise
-        """
-        return layer_idx in self.layer_params
-
-    def get_active_layers(self) -> List[int]:
-        """
-        Get list of layer indices that have LoRA modules.
-
-        Returns:
-            List of layer indices with LoRA modules
-        """
-        return self.active_layer_indices.copy()
-
-    def get_layer_module_count(self, layer_idx: int) -> int:
-        """
-        Get the number of modules in a layer.
-
-        Args:
-            layer_idx: Index of the layer
-
-        Returns:
-            Number of modules in the layer, or 0 if layer has no LoRA modules
-        """
-        if layer_idx not in self.layer_info:
-            return 0
-        return self.layer_info[layer_idx]['module_num']
+        return self.layer_params.get(layer_key)
