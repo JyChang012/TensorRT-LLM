@@ -58,7 +58,8 @@ void cuda_graph_grouped_gemm(cutlass::gemm::GemmCoord* problem_sizes_ptr, int pr
 void cuda_graph_splitk_grouped_gemm(cutlass::gemm::GemmCoord* problem_sizes_ptr, int problem_count, void** ptrA_gpu,
     void** ptrB_gpu, void** ptrC_gpu, void** ptrD_gpu, int64_t* lda_gpu, int64_t* ldb_gpu, int64_t* ldc_gpu,
     int64_t* ldd_gpu, void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, bool isLoraIn,
-    nvinfer1::DataType dataType, int splitKSlices, int minKN, cudaStream_t stream);
+    nvinfer1::DataType dataType, int splitKSlices, int minKN, cutlass::gemm::GemmCoord* host_max_problem_sizes_ptr,
+    int64_t* splitk_offsets_gpu, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

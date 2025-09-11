@@ -1295,7 +1295,8 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
-            cache_indirection_buffer: Optional[torch.Tensor] = None):
+            cache_indirection_buffer: Optional[torch.Tensor] = None,
+            maybe_graph: bool = False):
         """
         Prepare inputs for Pytorch Model.
         """
@@ -1660,7 +1661,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.prepare()
 
         lora_params = self._get_lora_params_from_requests(
-            scheduled_requests, attn_metadata)
+            scheduled_requests, attn_metadata, maybe_graph)
 
         attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
         padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
@@ -2107,7 +2108,8 @@ class PyTorchModelEngine(ModelEngine):
 
     def _get_lora_params_from_requests(self,
                                        scheduled_requests: ScheduledRequests,
-                                       attn_metadata: AttentionMetadata):
+                                       attn_metadata: AttentionMetadata,
+                                       maybe_graph: bool = False):
         '''
         Get LoRA parameters from scheduled requests.
 
@@ -2117,40 +2119,23 @@ class PyTorchModelEngine(ModelEngine):
             Dictionary containing LoRA parameters, or None if no LoRA requests
         '''
         # Check if we should use CUDA Graph mode
-        use_cuda_graph_mode = self.cuda_graph_lora_manager is not None
+        use_cuda_graph_mode = self.cuda_graph_lora_manager is not None and maybe_graph
 
         if use_cuda_graph_mode:
-            # Get PEFT table from resource manager if available
-            try:
-                '''
-                peft_cache_manager = getattr(self, '_peft_cache_manager', None)
-                if peft_cache_manager is None:
-                    # Fallback to legacy mode if PEFT cache manager not available
-                    return self._get_legacy_lora_params_from_requests(
-                        scheduled_requests, attn_metadata)
-                '''
+            # Get PEFT table from request's py_lora_task_layer_module_configs
+            # Since all requests with the same task_id have the same layer-module-configs,
+            # we can extract it from any request that has LoRA configurations
+            peft_table = {}
+            request_list = scheduled_requests.context_requests + scheduled_requests.generation_requests
 
-                # Get PEFT table from request's py_lora_task_layer_module_configs
-                # Since all requests with the same task_id have the same layer-module-configs,
-                # we can extract it from any request that has LoRA configurations
-                peft_table = {}
-                request_list = scheduled_requests.context_requests + scheduled_requests.generation_requests
+            for request in request_list:
+                if (hasattr(request, 'py_lora_task_layer_module_configs') and
+                        request.py_lora_task_layer_module_configs is not None):
+                    peft_table = request.py_lora_task_layer_module_configs
+                    break
 
-                for request in request_list:
-                    if (hasattr(request, 'py_lora_task_layer_module_configs')
-                            and request.py_lora_task_layer_module_configs
-                            is not None):
-                        peft_table = request.py_lora_task_layer_module_configs
-                        break
-
-                return self.cuda_graph_lora_manager.prepare_cuda_graph_lora_params(
-                    scheduled_requests, attn_metadata, peft_table)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to prepare CUDA Graph LoRA params, falling back to legacy mode: {e}"
-                )
-                return self._get_legacy_lora_params_from_requests(
-                    scheduled_requests, attn_metadata)
+            return self.cuda_graph_lora_manager.prepare_cuda_graph_lora_params(
+                scheduled_requests, attn_metadata, peft_table)
         else:
             return self._get_legacy_lora_params_from_requests(
                 scheduled_requests, attn_metadata)
@@ -2176,14 +2161,21 @@ class PyTorchModelEngine(ModelEngine):
         lora_params = {}
         tmp_lora_params = {}
 
+        peft_table = None
+
         request_list = scheduled_requests.context_requests + scheduled_requests.generation_requests
 
         # trace all requests to get the union set of the lora params
         for request in request_list:
-            if request.py_lora_task_layer_module_configs is None:
+            if request.py_lora_task_layer_module_configs is not None and peft_table is None:
+                peft_table = request.py_lora_task_layer_module_configs
+
+            if request.lora_task_id is None:
                 continue
 
-            for module in request.py_lora_task_layer_module_configs:
+            layer_module_configs = peft_table[request.lora_task_id]
+
+            for module in layer_module_configs:
                 module_id = module.module_id
                 layer_id = module.layer_id
 
@@ -2210,7 +2202,7 @@ class PyTorchModelEngine(ModelEngine):
 
         for request in request_list:
             # Need to set default values for this case
-            if request.py_lora_task_layer_module_configs is None:
+            if request.lora_task_id is None:
                 for layer_id in lora_params:
                     for module_id in lora_params[layer_id]:
                         current_lora_params = lora_params[layer_id][module_id]
@@ -2250,14 +2242,14 @@ class PyTorchModelEngine(ModelEngine):
         return lora_params
 
     @nvtx_range("_prepare_inputs")
-    def _prepare_inputs(
-            self,
-            scheduled_requests: ScheduledRequests,
-            kv_cache_manager: KVCacheManager,
-            attn_metadata: AttentionMetadata,
-            spec_metadata: Optional[SpecMetadata] = None,
-            new_tensors_device: Optional[SampleStateTensors] = None,
-            cache_indirection_buffer: Optional[torch.Tensor] = None):
+    def _prepare_inputs(self,
+                        scheduled_requests: ScheduledRequests,
+                        kv_cache_manager: KVCacheManager,
+                        attn_metadata: AttentionMetadata,
+                        spec_metadata: Optional[SpecMetadata] = None,
+                        new_tensors_device: Optional[SampleStateTensors] = None,
+                        cache_indirection_buffer: Optional[torch.Tensor] = None,
+                        maybe_graph: bool = False):
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
             if CpType.STAR == cp_type:
@@ -2269,7 +2261,8 @@ class PyTorchModelEngine(ModelEngine):
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
                                            attn_metadata, spec_metadata,
                                            new_tensors_device,
-                                           cache_indirection_buffer)
+                                           cache_indirection_buffer,
+                                           maybe_graph)
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
@@ -2333,7 +2326,7 @@ class PyTorchModelEngine(ModelEngine):
 
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
-                new_tensors_device, cache_indirection_buffer)
+                new_tensors_device, cache_indirection_buffer, maybe_graph)
 
             self.iter_counter += 1
 
