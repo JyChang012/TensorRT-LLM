@@ -189,20 +189,26 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
     th::Tensor const& lda,                 // Leading dimensions for A matrices [layer_module_num, max_lora_size]
     th::Tensor const& ldb,                 // Leading dimensions for B matrices [layer_module_num, max_lora_size]
     th::Tensor const& ldd, // Leading dimensions for C matrices [layer_module_num, max_lora_size] (unused)
-    th::Tensor const& ldb_prime, th::Tensor const& ldd_prime)
+    th::Tensor const& ldb_prime, th::Tensor const& ldd_prime, th::Tensor const& host_max_in_sizes,
+    th::Tensor const& host_max_out_sizes, th::Tensor const& splitk_offsets)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
+    sync_check_cuda_error(stream);
+
     // Create reordered input buffer using gather operation with sorted_ids
     // This replaces the physical reordering with efficient gather/scatter
     auto reordered_input = torch::gather(input, 0, sorted_ids.unsqueeze(1).expand({-1, input.size(1)}));
+
+    sync_check_cuda_error(stream);
 
     // Create output tensor with same shape as output_buffer (not input!)
     // This is necessary because LoRA output dimensions can differ from input dimensions
     // (e.g., attention layers: input=hidden_dim, output=3*hidden_dim for q,k,v)
     auto output = torch::zeros_like(output_buffer);
+    sync_check_cuda_error(stream);
 
     // Step 2: Convert offsets to actual pointers using CUDA Graph compatible operations
     // Use PyTorch tensor operations to add base addresses to offset tensors on GPU
@@ -243,6 +249,9 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
     auto* problem_sizes_1_ptr = reinterpret_cast<cutlass::gemm::GemmCoord*>(lora_in_sizes.data_ptr());
     auto* problem_sizes_2_ptr = reinterpret_cast<cutlass::gemm::GemmCoord*>(lora_out_sizes.data_ptr());
 
+    auto* host_max_in_sizes_ptr = reinterpret_cast<cutlass::gemm::GemmCoord*>(host_max_in_sizes.data_ptr());
+    auto* host_max_out_sizes_ptr = reinterpret_cast<cutlass::gemm::GemmCoord*>(host_max_out_sizes.data_ptr());
+
     // Step 4: Get weight pointers using CUDA Graph compatible operations
     // The b_ptrs and b_prime_ptrs tensors already contain pointer values as int64
     // Cast them directly to void* arrays for the GEMM kernels (remove const for CUTLASS compatibility)
@@ -256,6 +265,8 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
     auto* ldd_gpu = reinterpret_cast<int64_t*>(const_cast<void*>(ldd.data_ptr()));
     auto* ldb_prime_gpu = reinterpret_cast<int64_t*>(const_cast<void*>(ldb_prime.data_ptr()));
     auto* ldd_prime_gpu = reinterpret_cast<int64_t*>(const_cast<void*>(ldd_prime.data_ptr()));
+
+    auto* splitk_offsets_gpu = reinterpret_cast<int64_t*>(const_cast<void*>(splitk_offsets.data_ptr()));
 
     // Step 5: Direct CUTLASS grouped GEMM setup (no CuBLAS wrapper needed)
     // The new CUDA Graph compatible implementation uses CUTLASS directly
@@ -287,7 +298,8 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
             loraRuntimeDataType,
             16,                                             // splitKSlices
             1,                                              // minKN
-            stream);
+            host_max_in_sizes_ptr, splitk_offsets_gpu, stream);
+        sync_check_cuda_error(stream);
     }
 
     // Step 7: Call CUDA Graph compatible grouped GEMM for lora_out
@@ -302,12 +314,15 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
             loraRuntimeDataType,
             1,                                                                      // minKN
             stream);
+        sync_check_cuda_error(stream);
     }
 
     // Step 8: Reorder output back to original order using direct scatter operation
     // Since reordered_input[i] = input[sorted_ids[i]], we want output[sorted_ids[i]] = output_buffer[i]
     // This can be achieved directly with scatter using sorted_ids as indices
     output.scatter_(0, sorted_ids.unsqueeze(1).expand({-1, output_buffer.size(1)}), output_buffer);
+
+    sync_check_cuda_error(stream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return output;
@@ -348,7 +363,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor ldb, "
         "Tensor ldd, "
         "Tensor ldb_prime, "
-        "Tensor ldd_prime) -> Tensor");
+        "Tensor ldd_prime, "
+        "Tensor host_max_in_sizes, "
+        "Tensor host_max_out_sizes, "
+        "Tensor splitk_offsets) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

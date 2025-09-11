@@ -277,7 +277,6 @@ class CudaGraphLoraManager:
         # This bridges the old and new interfaces
         lora_params = {
             'cuda_graph_params': cuda_graph_lora_params,
-            'slot_ids': cuda_graph_lora_params.slot_ids,
             'host_request_types': attn_metadata.host_request_types,
             'prompt_lens_cpu': attn_metadata.prompt_lens_cpu,
             'num_seqs': attn_metadata.num_seqs,
