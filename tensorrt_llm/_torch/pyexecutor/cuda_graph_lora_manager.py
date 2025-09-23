@@ -167,15 +167,16 @@ class CudaGraphLoraManager:
                 module_id = config.module_id
                 key = layer_module2key[(layer_idx, module_id)]
                 info = self.layer_info[key]
-                in_size = config.in_size // 16  # TODO: other dtype
-                out_size = config.out_size // 16  # TODO: other dtype
+                assert config.in_size % config.adapter_size == 0 and config.out_size % config.adapter_size == 0
+                in_dim = config.in_size // config.adapter_size
+                out_dim = config.out_size // config.adapter_size
                 if info.input_hidden_size == 0:
-                    info.input_hidden_size = in_size
+                    info.input_hidden_size = in_dim
                 else:
-                    assert info.input_hidden_size == in_size, f"Layer {key} has modules with different input sizes, old input size is {info.input_hidden_size}, new input size is {in_size}"
-                assert info.output_sizes[key.module_ids.index(
-                    module_id
-                )] == out_size, f"LayerKey {key} has modules with different output sizes"
+                    assert info.input_hidden_size == in_dim, f"Layer {key} has modules with different input sizes, old input size is {info.input_hidden_size}, new input size is {in_dim}"
+                info_output_size = info.output_sizes[key.module_ids.index(
+                    module_id)]
+                assert info_output_size == out_dim, f"LayerKey {key} has modules with different output sizes, config output size is {out_dim}, info output size is {info_output_size}"
                 assert config.adapter_size <= self.max_lora_rank, f"Layer {layer_idx}, module {module_id} has rank {config.adapter_size} which is greater than max_lora_rank {self.max_lora_rank}"
                 # TODO: check if all modules in key present in configs
 
