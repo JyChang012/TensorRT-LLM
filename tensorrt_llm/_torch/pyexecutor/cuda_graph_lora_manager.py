@@ -225,6 +225,9 @@ class CudaGraphLoraManager:
         Returns:
             Dictionary containing CUDA Graph compatible LoRA parameters, or None if no LoRA
         """
+        assert len(
+            scheduled_requests.context_requests
+        ) == 0, f"Context requests are not supported with LoRA CUDA Graph path. Have {len(scheduled_requests.context_requests)} context requests"
         request_list = scheduled_requests.context_requests + scheduled_requests.generation_requests
 
         # Check if any requests have LoRA
@@ -237,9 +240,12 @@ class CudaGraphLoraManager:
 
         batch_size = len(request_list)
 
+        # print(f"num gen requests: {len(scheduled_requests.generation_requests)}, request_id: {[req.py_request_id for req in scheduled_requests.generation_requests]}")
         # Get slot assignments for this batch
         request_to_slot_id = self.adapter_slot_manager.get_slot_mapping_for_batch(
             scheduled_requests)
+
+        # print(f"request_id_to_slot_id: {request_to_slot_id}")
 
         # Get or create the single lora_params instance using peft_table for configuration
         cuda_graph_lora_params = self.get_or_create_lora_params(peft_table)
@@ -249,6 +255,7 @@ class CudaGraphLoraManager:
             request_to_slot_id.get(req.py_request_id, self.max_lora_size)
             for req in request_list
         ]
+        # print(f"slot_ids_list: {slot_ids_list}")
         cuda_graph_lora_params.update_slot_ids(slot_ids_list, batch_size)
         slot_counts = torch.bincount(torch.tensor(slot_ids_list,
                                                   dtype=torch.int32),
@@ -256,10 +263,13 @@ class CudaGraphLoraManager:
         assert slot_counts.size(0) <= self.max_lora_size + 1
         slot_counts = slot_counts[:self.
                                   max_lora_size]  # exclude the base model slot
+        # print(f"slot_counts: {slot_counts}")
 
         # Get current slot to task mapping
         slot_to_task_mapping = self.adapter_slot_manager.get_slot_to_task_mapping(
         )
+
+        # print(f"slot_to_task_mapping: {slot_to_task_mapping}")
 
         # Update weight pointers if slot assignments changed
         if self.adapter_slot_manager.has_slots_changed():

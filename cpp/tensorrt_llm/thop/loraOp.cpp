@@ -173,7 +173,7 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
     return output_torch;
 }
 
-th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
+th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& reordered_input,
     th::Tensor const& lora_in_sizes,       // [layer_module_num, max_lora_size, 3]
     th::Tensor const& lora_out_sizes,      // [layer_module_num, max_lora_size, 3]
     th::Tensor const& a_offsets,           // [layer_module_num, max_lora_size]
@@ -200,46 +200,17 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
 
     // Create reordered input buffer using gather operation with sorted_ids
     // This replaces the physical reordering with efficient gather/scatter
-    auto reordered_input = torch::gather(input, 0, sorted_ids.unsqueeze(1).expand({-1, input.size(1)}));
-
-    sync_check_cuda_error(stream);
 
     // Create output tensor with same shape as output_buffer (not input!)
     // This is necessary because LoRA output dimensions can differ from input dimensions
     // (e.g., attention layers: input=hidden_dim, output=3*hidden_dim for q,k,v)
-    auto output = torch::zeros_like(output_buffer);
-    sync_check_cuda_error(stream);
-
-    // Step 2: Convert offsets to actual pointers using CUDA Graph compatible operations
-    // Use PyTorch tensor operations to add base addresses to offset tensors on GPU
-    auto reordered_input_ptr = reinterpret_cast<int64_t>(reordered_input.data_ptr());
-    auto intermediate_buffer_ptr = reinterpret_cast<int64_t>(intermediate_buffer.data_ptr());
-    auto output_buffer_ptr = reinterpret_cast<int64_t>(output_buffer.data_ptr());
-
-    auto typeSize = input.element_size();
-
-    // Create actual pointer tensors by adding base addresses to offsets on GPU
-    // This maintains CUDA graph compatibility by keeping operations on GPU
-    // No need for .clone() since we're creating new tensors, not modifying originals
-    auto a_ptrs_tensor = a_offsets * typeSize + reordered_input_ptr;
-    auto d_ptrs_tensor = d_offsets * typeSize + intermediate_buffer_ptr;
-    auto a_prime_ptrs_tensor = d_offsets * typeSize + intermediate_buffer_ptr; // Same as d_ptrs
-    auto d_prime_ptrs_tensor = d_prime_offsets * typeSize + output_buffer_ptr;
-
-    // Flatten tensors for grouped GEMM API
-    auto a_ptrs_flat = a_ptrs_tensor.flatten();
-    auto d_ptrs_flat = d_ptrs_tensor.flatten();
-    auto a_prime_ptrs_flat = a_prime_ptrs_tensor.flatten();
-    auto d_prime_ptrs_flat = d_prime_ptrs_tensor.flatten();
-
-    // GPU pointers are now ready for direct use with CUDA Graph compatible GEMM functions
 
     // Convert flattened pointer tensors to GPU pointer arrays for CUDA Graph compatible access (remove const for
     // CUTLASS)
-    auto* a_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(a_ptrs_flat.data_ptr()));
-    auto* d_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(d_ptrs_flat.data_ptr()));
-    auto* a_prime_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(a_prime_ptrs_flat.data_ptr()));
-    auto* d_prime_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(d_prime_ptrs_flat.data_ptr()));
+    auto* a_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(a_offsets.data_ptr()));
+    auto* d_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(d_offsets.data_ptr()));
+    auto* a_prime_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(d_offsets.data_ptr()));
+    auto* d_prime_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(d_prime_offsets.data_ptr()));
 
     // Step 3: Prepare GEMM problem sizes using CUDA Graph compatible operations
     // The lora_in_sizes and lora_out_sizes tensors are already in cutlass::gemm::GemmCoord format
@@ -273,7 +244,7 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
 
     // Get data type
     nvinfer1::DataType loraRuntimeDataType;
-    switch (input.scalar_type())
+    switch (reordered_input.scalar_type())
     {
     case torch::kFloat16: loraRuntimeDataType = nvinfer1::DataType::kHALF; break;
     case torch::kBFloat16: loraRuntimeDataType = nvinfer1::DataType::kBF16; break;
@@ -281,14 +252,15 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
     }
 
     // Calculate workspace size - only need execution workspace, no parameter workspace
-    size_t execution_workspace_size = 8 * 1024 * 1024; // 8MB for GEMM execution
-    auto execution_workspace
-        = torch::empty({static_cast<int64_t>(execution_workspace_size)}, input.options().dtype(torch::kUInt8));
+    size_t execution_workspace_size = 8 * 1024 * 1024; // TODO: 16MB for GEMM execution
+    auto execution_workspace = torch::empty(
+        {static_cast<int64_t>(execution_workspace_size)}, reordered_input.options().dtype(torch::kUInt8));
 
     // Step 6: Call CUDA Graph compatible grouped GEMM for lora_in (split-K)
     // No parameter workspace needed - tensors are already on GPU
     if (problem_count > 0)
     {
+        TLLM_LOG_TRACE("Start Grouped GEMM for LoRA in.");
         tk::cuda_graph_splitk_grouped_gemm(problem_sizes_1_ptr, problem_count, a_ptrs_gpu, b_ptrs_gpu,
             d_ptrs_gpu,                                     // ptrC (no bias)
             d_ptrs_gpu, lda_gpu, ldb_gpu, ldd_gpu, ldd_gpu, // Precomputed leading dimensions
@@ -299,12 +271,24 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
             16,                                             // splitKSlices
             1,                                              // minKN
             host_max_in_sizes_ptr, splitk_offsets_gpu, stream);
+        /*
+        tk::cuda_graph_grouped_gemm(problem_sizes_1_ptr, problem_count, a_ptrs_gpu, b_ptrs_gpu,
+            d_ptrs_gpu,                                     // ptrC (no bias)
+            d_ptrs_gpu, lda_gpu, ldb_gpu, ldd_gpu, ldd_gpu, // Precomputed leading dimensions
+            execution_workspace.data_ptr(),                 // Only execution workspace needed
+            execution_workspace_size,
+            true,                                           // isLoraIn
+            loraRuntimeDataType,
+            1,                                              // minKN
+            stream);
+        */
         sync_check_cuda_error(stream);
     }
 
     // Step 7: Call CUDA Graph compatible grouped GEMM for lora_out
     if (problem_count > 0)
     {
+        TLLM_LOG_TRACE("Start Grouped GEMM for LoRA out.");
         tk::cuda_graph_grouped_gemm(problem_sizes_2_ptr, problem_count, a_prime_ptrs_gpu, b_prime_ptrs_gpu,
             d_prime_ptrs_gpu,                                                       // ptrC (no bias)
             d_prime_ptrs_gpu, ldd_gpu, ldb_prime_gpu, ldd_prime_gpu, ldd_prime_gpu, // Precomputed leading dimensions
@@ -317,15 +301,8 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& input,
         sync_check_cuda_error(stream);
     }
 
-    // Step 8: Reorder output back to original order using direct scatter operation
-    // Since reordered_input[i] = input[sorted_ids[i]], we want output[sorted_ids[i]] = output_buffer[i]
-    // This can be achieved directly with scatter using sorted_ids as indices
-    output.scatter_(0, sorted_ids.unsqueeze(1).expand({-1, output_buffer.size(1)}), output_buffer);
-
-    sync_check_cuda_error(stream);
-
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return output;
+    return output_buffer;
 }
 
 } // namespace torch_ext
@@ -346,7 +323,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "bool isRemoveInputPadding) -> Tensor[]");
 
     m.def(
-        "lora_grouped_gemm_cuda_graph(Tensor input, "
+        "lora_grouped_gemm_cuda_graph(Tensor reordered_input, "
         "Tensor lora_in_sizes, "
         "Tensor lora_out_sizes, "
         "Tensor a_offsets, "

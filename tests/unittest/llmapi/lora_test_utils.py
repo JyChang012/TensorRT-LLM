@@ -53,6 +53,7 @@ def check_llama_7b_multi_unique_lora_adapters_from_request(
 
     # Perform repeats of the same requests to test reuse and reload of adapters previously unloaded from cache
     try:
+        similarity_ret = []
         for _ in range(repeat_calls):
             last_idx = 0
             for adapter_count in lora_adapter_count_per_call:
@@ -67,8 +68,17 @@ def check_llama_7b_multi_unique_lora_adapters_from_request(
                 for output, ref in zip(
                         outputs, references[last_idx:last_idx + adapter_count] *
                         repeats_per_call):
-                    assert similar(output.outputs[0].text, ref)
+                    similarity_ret.append([
+                        similar(output.outputs[0].text, ref),
+                        (output.outputs[0].text, ref)
+                    ])
+                    '''
+                    assert similar(output.outputs[0].text, ref), f"Output:\n{output.outputs[0].text}\n\nReference:\n{ref}"
+                    print(f"Output:\n{output.outputs[0].text}\n\nReference:\n{ref}")
+                    '''
                 last_idx += adapter_count
+        assert all(ret[0] for ret in
+                   similarity_ret), f"Similarity check failed: {similarity_ret}"
     finally:
         llm.shutdown()
 
@@ -114,11 +124,29 @@ def check_llama_7b_multi_lora_from_request_test_harness(
                                    None, lora_req1, lora_req2, None, lora_req1,
                                    lora_req2
                                ])
+        '''
+        outputs = llm.generate(prompts[0],
+                               sampling_params,
+                               lora_request=[
+                                   lora_req1
+                               ])
+        '''
     finally:
         llm.shutdown()
+    similarity_ret = []
     for output, ref, key_word in zip(outputs, references, key_words):
+        similarity_ret.append([
+            similar(output.outputs[0].text, ref)
+            or key_word in output.outputs[0].text, (output.outputs[0].text, ref)
+        ])
+        '''
         assert similar(output.outputs[0].text,
-                       ref) or key_word in output.outputs[0].text
+                       ref) or key_word in output.outputs[0].text, f"Output:\n{output.outputs[0].text}\n\nReference:\n{ref}"
+        print(f"Output:\n{output.outputs[0].text}\n\nReference:\n{ref}")
+        '''
+    assert all(
+        ret[0]
+        for ret in similarity_ret), f"Similarity check failed: {similarity_ret}"
 
 
 def create_mock_nemo_lora_checkpoint(

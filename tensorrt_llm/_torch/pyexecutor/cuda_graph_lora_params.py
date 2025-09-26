@@ -43,7 +43,7 @@ class CudaGraphLoraParams:
 
         def is_enabled(self) -> bool:
             """
-            Check if the layer is enabled in sample LoRA task. We assume that all LoRA tasks occupy the same layers. TODO: remove this restriction?
+            Check if the layer is enabled in the sample LoRA task. We assume that all LoRA tasks occupy the same layers. TODO: remove this restriction?
             Only input_hidden_size is initialized by the sample LoRA task, so use that to check if the layer is enabled.
             """
             return self.input_hidden_size > 0
@@ -80,6 +80,7 @@ class CudaGraphLoraParams:
         # TODO: to be removed
         self.slot_ids = torch.empty(1, dtype=torch.int32, device=device)
 
+        # TODO: sort in graph instead
         # Sorted indices for gather/scatter operations (persistent device tensor)
         # Will contain indices that sort tokens by their slot_ids for efficient gather/scatter
         # Shape: [max_batch_size], values are indices in [0, max_batch_size-1]
@@ -109,7 +110,7 @@ class CudaGraphLoraParams:
             # Create layer parameters
             self.layer_params[key] = self._create_layer_params(
                 key, info.module_num, info.output_sizes)
-        print(f"layer_info: {self.layer_info}")
+        # print(f"layer_info: {self.layer_info}")
 
     def _create_layer_params(
             self, key: LoraLayerKey, layer_module_num: int,
@@ -156,7 +157,10 @@ class CudaGraphLoraParams:
 
         # Compute sorted indices for gather/scatter operations
         # Use stable sort to maintain deterministic ordering for tokens with same slot_id
-        _, sorted_indices = torch.sort(slot_ids, stable=True)
+        sorted_slot_ids, sorted_indices = torch.sort(slot_ids, stable=True)
+
+        # print(f"sorted_slot_ids: {sorted_slot_ids}")
+        # print(f"sorted_indices: {sorted_indices}")
 
         # Update sorted_ids tensor with the computed indices
         if actual_batch_size <= self.max_batch_size:
@@ -166,6 +170,7 @@ class CudaGraphLoraParams:
         else:
             # otherwise not an gen-only batch, use new allocated sorted_ids
             self.sorted_ids = sorted_indices.to(device=self.device)
+        # print(f"sorted_ids to be used: {self.sorted_ids}; actual_batch_size: {actual_batch_size}")
 
     def update_weight_pointers(self, peft_table: Dict[int, List],
                                slot_to_task_mapping: Dict[int, Optional[int]]):
@@ -190,6 +195,7 @@ class CudaGraphLoraParams:
             ranks[slot_id] = config.adapter_size
 
         self.slot_ranks.copy_(ranks)
+        # print(f"slot_ranks: {self.slot_ranks}")
 
         host_weight_in_ptrs = dict()
         host_weight_out_ptrs = dict()
@@ -255,6 +261,9 @@ class CudaGraphLoraParams:
         """
 
         slot_token_offset = self.get_offset_from_counts(slot_counts)
+
+        # print(f"slot_token_offset: {slot_token_offset}")
+
         assert slot_token_offset.ndim == 1 and slot_token_offset.shape[
             0] == self.max_lora_size
 

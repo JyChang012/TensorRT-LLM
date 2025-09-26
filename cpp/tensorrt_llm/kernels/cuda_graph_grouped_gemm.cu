@@ -24,6 +24,8 @@
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/device/splitk_gemm_grouped.h"
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/default_splitk_gemm_grouped.h"
 
+// TODO: alignment determination and mKN, isLoraIn
+
 namespace tensorrt_llm
 {
 namespace kernels
@@ -116,6 +118,7 @@ void cuda_graph_grouped_gemm_template(cutlass::gemm::GemmCoord* problem_sizes_pt
 
     // Execute the GEMM
     status = gemm_op.run(stream);
+    sync_check_cuda_error(stream);
     TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "Failed to execute grouped GEMM");
 }
 
@@ -127,42 +130,54 @@ void cuda_graph_grouped_gemm(cutlass::gemm::GemmCoord* problem_sizes_ptr, int pr
     // Based on the original groupGemm.cu logic for kernel selection
     if (dataType == nvinfer1::DataType::kHALF)
     {
-        if (minKN >= 128 * 128)
+        if (minKN >= 8)
         {
-            cuda_graph_grouped_gemm_template<128, 128, 64, 128, 128, 64, cutlass::half_t, 8, 8, 4>(problem_sizes_ptr,
+            cuda_graph_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 8, 4>(problem_sizes_ptr,
                 problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
                 gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
         }
-        else if (minKN >= 64 * 64)
+        else if (minKN >= 4)
         {
-            cuda_graph_grouped_gemm_template<64, 64, 64, 64, 64, 64, cutlass::half_t, 8, 8, 4>(problem_sizes_ptr,
+            cuda_graph_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 4, 4>(problem_sizes_ptr,
                 problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
                 gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
         }
-        else
+        else if (minKN >= 2)
         {
-            cuda_graph_grouped_gemm_template<32, 32, 32, 32, 32, 32, cutlass::half_t, 8, 8, 4>(problem_sizes_ptr,
+            cuda_graph_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 2, 2>(problem_sizes_ptr,
+                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
+                gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
+        }
+        else if (minKN >= 1)
+        {
+            cuda_graph_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 1, 1, 2>(problem_sizes_ptr,
                 problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
                 gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
         }
     }
     else if (dataType == nvinfer1::DataType::kBF16)
     {
-        if (minKN >= 128 * 128)
+        if (minKN >= 8)
         {
-            cuda_graph_grouped_gemm_template<128, 128, 64, 128, 128, 64, cutlass::bfloat16_t, 8, 8, 4>(
-                problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
-                ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
-        }
-        else if (minKN >= 64 * 64)
-        {
-            cuda_graph_grouped_gemm_template<64, 64, 64, 64, 64, 64, cutlass::bfloat16_t, 8, 8, 4>(problem_sizes_ptr,
+            cuda_graph_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::bfloat16_t, 8, 8, 4>(problem_sizes_ptr,
                 problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
                 gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
         }
-        else
+        else if (minKN >= 4)
         {
-            cuda_graph_grouped_gemm_template<32, 32, 32, 32, 32, 32, cutlass::bfloat16_t, 8, 8, 4>(problem_sizes_ptr,
+            cuda_graph_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::bfloat16_t, 8, 4, 4>(problem_sizes_ptr,
+                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
+                gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
+        }
+        else if (minKN >= 2)
+        {
+            cuda_graph_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::bfloat16_t, 8, 2, 2>(problem_sizes_ptr,
+                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
+                gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
+        }
+        else if (minKN >= 1)
+        {
+            cuda_graph_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::bfloat16_t, 1, 1, 2>(problem_sizes_ptr,
                 problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
                 gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
         }
@@ -265,6 +280,7 @@ void cuda_graph_splitk_grouped_gemm_template(cutlass::gemm::GemmCoord* problem_s
 
     // Execute the GEMM
     status = gemm_op.run(stream);
+    sync_check_cuda_error(stream);
     TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess,
         "Failed to execute split-K grouped GEMM. Problem count: %d, Split-K slices: %d, Error: %s", problem_count,
         splitKSlices, cutlass::cutlassGetStatusString(status));
