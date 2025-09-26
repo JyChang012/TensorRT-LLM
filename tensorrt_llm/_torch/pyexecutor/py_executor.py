@@ -233,8 +233,14 @@ class PyExecutor:
         self.inflight_req_ids = ReqIdsSet()
 
         # During warmup, we don't enable the profiler
+        '''
         self.is_warmup = True
         self.model_engine.warmup(self.resource_manager)
+        '''
+
+        self.is_warmup = False  # TODO: disable for now for cuda graph + LoRA, hardcode
+        if False:
+            self.model_engine.warmup(self.resource_manager)
         if self.draft_model_engine is not None:
             self.draft_model_engine.warmup(self.resource_manager)
         self.is_warmup = False

@@ -6,7 +6,7 @@ import pytest
 from tensorrt_llm import LLM
 from tensorrt_llm.executor import GenerationExecutorWorker
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
+from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
@@ -39,6 +39,9 @@ from peft import get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # isort: on
+
+# TODO: hardcode for now
+cuda_graph_config = CudaGraphConfig(max_batch_size=6, enable_padding=True)
 
 
 @force_ampere
@@ -297,7 +300,7 @@ def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_lora():
-    llama_7b_lora_from_dir_test_harness()
+    llama_7b_lora_from_dir_test_harness(cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
@@ -306,7 +309,9 @@ def test_llama_7b_lora_default_modules() -> None:
 
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
 
-    llm = LLM(model=hf_model_dir, lora_config=lora_config)
+    llm = LLM(model=hf_model_dir,
+              lora_config=lora_config,
+              cuda_graph_config=cuda_graph_config)
 
     hf_lora_dir = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
     try:
@@ -350,7 +355,17 @@ def _check_llama_7b_multi_lora_evict_load_new_adapters(
         lora_config=lora_config,
         # Disable CUDA graph
         # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        cuda_graph_config=None)
+        cuda_graph_config=cuda_graph_config)
+
+
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_bs1():
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[1, 1, 1, 1],
+        max_loras=3,
+        max_cpu_loras=1,
+        repeat_calls=1,
+        repeats_per_call=1)
 
 
 @skip_gpu_memory_less_than_40gb
@@ -435,7 +450,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
                 host_cache_size=1),  # size in bytes
             # Disable CUDA graph
             # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-            cuda_graph_config=None)
+            cuda_graph_config=cuda_graph_config)
 
     # Test that too small PeftCacheConfig.device_cache_percent causes failure
     with pytest.raises(RuntimeError):
@@ -445,7 +460,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
             peft_cache_config=PeftCacheConfig(device_cache_percent=0.0000001),
             # Disable CUDA graph
             # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-            cuda_graph_config=None)
+            cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
@@ -464,7 +479,8 @@ def test_llama_7b_lora_config_overrides_peft_cache_config():
             host_cache_size=1,  # size in bytes
             device_cache_percent=0.0000001),
         # Disable CUDA graph
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+        # TODO: disable cuda graph for a test error, graph capture out of bound?
+        # cuda_graph_config=cuda_graph_config
         cuda_graph_config=None)
 
 
@@ -484,7 +500,7 @@ def test_nemotron_nas_lora() -> None:
         model=
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
         lora_config=lora_config,
-    )
+        cuda_graph_config=cuda_graph_config)
 
     prompts = [
         "Hello, how are you?",
@@ -544,7 +560,10 @@ def test_codellama_fp8_with_bf16_lora() -> None:
                                  max_loras=2,
                                  max_cpu_loras=2)
 
-        llm = LLM(model_dir, quant_config=quant_config, lora_config=lora_config)
+        llm = LLM(model_dir,
+                  quant_config=quant_config,
+                  lora_config=lora_config,
+                  cuda_graph_config=cuda_graph_config)
 
         prompts = [
             "Write a function that calculates the Fibonacci sequence.",
@@ -595,7 +614,9 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
                                         max_lora_rank=8,
                                         max_loras=2,
                                         max_cpu_loras=2)
-        llm = LLM(model_dir, lora_config=trtllm_lora_config)
+        llm = LLM(model_dir,
+                  lora_config=trtllm_lora_config,
+                  cuda_graph_config=cuda_graph_config)
 
         prompts = [
             "Kim był Mikołaj Kopernik i z czego zasłynął?",
@@ -651,7 +672,8 @@ def test_gemma3_1b_instruct_multi_lora() -> None:
         )
         llm = LLM(model_dir,
                   lora_config=trtllm_lora_config,
-                  kv_cache_config=kv_cache_config)
+                  kv_cache_config=kv_cache_config,
+                  cuda_graph_config=cuda_graph_config)
 
         prompts = [
             "Is it ok to fill diesel in a petrol car?",
@@ -776,6 +798,7 @@ def test_gqa_nemo_lora(tmp_path):
         model=model_path,
         lora_config=lora_config,
         kv_cache_config=global_kvcache_config,
+        cuda_graph_config=cuda_graph_config,
     )
 
     try:

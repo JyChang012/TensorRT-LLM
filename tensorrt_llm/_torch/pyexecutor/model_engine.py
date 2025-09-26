@@ -2355,8 +2355,10 @@ class PyTorchModelEngine(ModelEngine):
 
             self.iter_counter += 1
 
+            # if True:  # TODO: remove this, test cuda graph path without actually use graph
             if not maybe_graph:
                 # Fallback to eager execution if graph was not used
+                logger.debug('Start forward step without graph')
                 with MoeLoadBalancerIterContext(moe_load_balancer):
                     outputs = self._forward_step(inputs, gather_ids,
                                                  gather_context_logits)
@@ -2371,6 +2373,7 @@ class PyTorchModelEngine(ModelEngine):
                                 gather_ids=gather_ids,
                                 gather_context_logits=gather_context_logits)
 
+                    logger.debug('Start graphcapture')
                     self.cuda_graph_runner.capture(batch_size,
                                                    capture_forward_fn, inputs)
 
@@ -2378,6 +2381,7 @@ class PyTorchModelEngine(ModelEngine):
                     # maybe we need a cleaner way to do this.
                     outputs = self.cuda_graph_runner.replay(batch_size, inputs)
                 else:
+                    logger.debug('Start graph replay')
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         outputs = self.cuda_graph_runner.replay(
                             batch_size, inputs)
