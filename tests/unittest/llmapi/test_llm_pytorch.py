@@ -15,7 +15,9 @@ from tensorrt_llm.sampling_params import SamplingParams
 from .lora_test_utils import (
     check_llama_7b_multi_lora_from_request_test_harness,
     check_llama_7b_multi_unique_lora_adapters_from_request,
-    create_mock_nemo_lora_checkpoint)
+    create_mock_nemo_lora_checkpoint,
+    DelayedAssert,
+)
 from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        global_kvcache_config, llama_model_path,
                        llm_get_stats_async_test_harness,
@@ -37,11 +39,73 @@ import torch
 from peft import LoraConfig as PeftLoraConfig
 from peft import get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from collections import OrderedDict
+from copy import deepcopy
 
 # isort: on
 
 # TODO: hardcode for now
-cuda_graph_config = CudaGraphConfig(max_batch_size=6, enable_padding=True)
+cuda_graph_config = CudaGraphConfig(max_batch_size=10, enable_padding=True)
+disable_overlap_scheduler = False
+# cuda_graph_config = None
+
+
+def test_llama_7b_cuda_graph_same_results():
+    hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
+    prompt_to_references = OrderedDict({
+        ("美国的首都在哪里? \n答案:", None):
+        "沃尔玛\n\n## 新闻\n\n* ",
+        ("アメリカ合衆国の首都はどこですか? \n答え:", None):
+        "Washington, D.C.\nWashington, D.C. is the capital of the United",
+    })
+    prompts_to_references = list(prompt_to_references.items())
+    selected = [0, 1, 1, 0, 1, 0]
+    prompts = [prompts_to_references[i][0][0] for i in selected]
+    references = [prompts_to_references[i][1] for i in selected]
+    kwargs = dict()
+    kwargs['lora_config'] = LoraConfig(
+        lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+        max_lora_rank=8,
+        max_loras=2,
+        max_cpu_loras=2)
+    kwargs['peft_cache_config'] = PeftCacheConfig(
+        host_cache_size=1,  # size in bytes
+        device_cache_percent=0.0000001)
+
+    llm = LLM(hf_model_dir,
+              cuda_graph_config=CudaGraphConfig(max_batch_size=10,
+                                                enable_padding=False),
+              disable_overlap_scheduler=disable_overlap_scheduler,
+              **kwargs)
+    sampling_params = SamplingParams(max_tokens=20, temperature=0, top_k=1)
+    asserter = DelayedAssert()
+    prev_outputs = None
+    for i in range(5):
+        print(f"Running {i}th time")
+        outputs = llm.generate(prompts.copy(), deepcopy(sampling_params))
+        outputs = [output.outputs[0].text for output in outputs]
+        if prev_outputs:
+            asserter.add(
+                outputs == prev_outputs,
+                f"{i}th runs: results vs previous: [{[c == prev for c, prev in zip(outputs, prev_outputs)]}]\nOutputs: {outputs}\nPrev outputs: {prev_outputs}"
+            )
+        else:
+            prev_outputs = outputs
+    if prev_outputs:
+        asserter.add(
+            prev_outputs == references,
+            f"{i}th runs: results1 vs references: {[c == ref for c, ref in zip(prev_outputs, references)]}\nOutputs1: {prev_outputs}\nReferences: {references}"
+        )
+        if outputs and prev_outputs != outputs:
+            asserter.add(
+                outputs == references,
+                f"{i}th runs: results2 vs references: {[c == ref for c, ref in zip(outputs, references)]}\nOutputs2: {outputs}\nReferences: {references}"
+            )
+
+    print(f'prev_outputs: {prev_outputs}')
+    print(f'outputs: {outputs}')
+    print(f'references: {references}')
+    asserter.assert_all()
 
 
 @force_ampere
@@ -300,7 +364,8 @@ def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_lora():
-    llama_7b_lora_from_dir_test_harness(cuda_graph_config=cuda_graph_config)
+    llama_7b_lora_from_dir_test_harness(
+        cuda_graph_config=deepcopy(cuda_graph_config))
 
 
 @skip_gpu_memory_less_than_40gb
@@ -311,7 +376,7 @@ def test_llama_7b_lora_default_modules() -> None:
 
     llm = LLM(model=hf_model_dir,
               lora_config=lora_config,
-              cuda_graph_config=cuda_graph_config)
+              cuda_graph_config=deepcopy(cuda_graph_config))
 
     hf_lora_dir = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
     try:
@@ -352,10 +417,12 @@ def _check_llama_7b_multi_lora_evict_load_new_adapters(
         repeat_calls,
         repeats_per_call,
         LLM,
-        lora_config=lora_config,
+        lora_config=deepcopy(lora_config),
         # Disable CUDA graph
         # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        cuda_graph_config=cuda_graph_config)
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        # enable_layerwise_nvtx_marker=True,
+        cuda_graph_config=cuda_graph_config.model_copy(deep=True))
 
 
 @skip_gpu_memory_less_than_40gb
@@ -397,12 +464,19 @@ def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache():
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_multi_lora_read_from_cache_after_insert():
     """Test that loading and then using the same adapters loaded in cache works."""
-    _check_llama_7b_multi_lora_evict_load_new_adapters(
-        lora_adapter_count_per_call=[3],
-        max_loras=3,
-        max_cpu_loras=3,
-        repeat_calls=2,
-        repeats_per_call=1)
+    n = 5
+    # repeat = 10
+    repeat = 5
+    for i in range(repeat):
+        print(
+            f"Running {i}th test_llama_7b_multi_lora_read_from_cache_after_insert"
+        )
+        _check_llama_7b_multi_lora_evict_load_new_adapters(
+            lora_adapter_count_per_call=[n],
+            max_loras=n,
+            max_cpu_loras=n,
+            repeat_calls=4,
+            repeats_per_call=1)
 
 
 @skip_gpu_memory_less_than_40gb
@@ -450,7 +524,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
                 host_cache_size=1),  # size in bytes
             # Disable CUDA graph
             # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-            cuda_graph_config=cuda_graph_config)
+            cuda_graph_config=deepcopy(cuda_graph_config))
 
     # Test that too small PeftCacheConfig.device_cache_percent causes failure
     with pytest.raises(RuntimeError):
@@ -460,7 +534,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
             peft_cache_config=PeftCacheConfig(device_cache_percent=0.0000001),
             # Disable CUDA graph
             # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-            cuda_graph_config=cuda_graph_config)
+            cuda_graph_config=deepcopy(cuda_graph_config))
 
 
 @skip_gpu_memory_less_than_40gb
@@ -468,20 +542,23 @@ def test_llama_7b_lora_config_overrides_peft_cache_config():
     """Tests that cache size args in lora_config LLM arg override the cache size
     parameters in peft_cache_config LLM arg.
     """    # noqa: D205
-    check_llama_7b_multi_lora_from_request_test_harness(
-        LLM,
-        lora_config=LoraConfig(
-            lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
-            max_lora_rank=8,
-            max_loras=2,
-            max_cpu_loras=2),
-        peft_cache_config=PeftCacheConfig(
-            host_cache_size=1,  # size in bytes
-            device_cache_percent=0.0000001),
-        # Disable CUDA graph
-        # TODO: disable cuda graph for a test error, graph capture out of bound?
-        # cuda_graph_config=cuda_graph_config
-        cuda_graph_config=None)
+    for i in range(5):
+        print(
+            f'Running {i}th test_llama_7b_lora_config_overrides_peft_cache_config'
+        )
+        check_llama_7b_multi_lora_from_request_test_harness(
+            LLM,
+            lora_config=LoraConfig(
+                lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+                max_lora_rank=8,
+                max_loras=2,
+                max_cpu_loras=2),
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            max_batch_size=10,
+            peft_cache_config=PeftCacheConfig(
+                host_cache_size=1,  # size in bytes
+                device_cache_percent=0.0000001),
+            cuda_graph_config=cuda_graph_config.model_copy(deep=True))
 
 
 # TODO smor: currently Nemotron-Super-49B-v1 with LoRA memory consumption is overly high
@@ -500,7 +577,7 @@ def test_nemotron_nas_lora() -> None:
         model=
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
         lora_config=lora_config,
-        cuda_graph_config=cuda_graph_config)
+        cuda_graph_config=deepcopy(cuda_graph_config))
 
     prompts = [
         "Hello, how are you?",
@@ -563,7 +640,7 @@ def test_codellama_fp8_with_bf16_lora() -> None:
         llm = LLM(model_dir,
                   quant_config=quant_config,
                   lora_config=lora_config,
-                  cuda_graph_config=cuda_graph_config)
+                  cuda_graph_config=deepcopy(cuda_graph_config))
 
         prompts = [
             "Write a function that calculates the Fibonacci sequence.",
@@ -616,7 +693,7 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
                                         max_cpu_loras=2)
         llm = LLM(model_dir,
                   lora_config=trtllm_lora_config,
-                  cuda_graph_config=cuda_graph_config)
+                  cuda_graph_config=deepcopy(cuda_graph_config))
 
         prompts = [
             "Kim był Mikołaj Kopernik i z czego zasłynął?",
@@ -673,7 +750,7 @@ def test_gemma3_1b_instruct_multi_lora() -> None:
         llm = LLM(model_dir,
                   lora_config=trtllm_lora_config,
                   kv_cache_config=kv_cache_config,
-                  cuda_graph_config=cuda_graph_config)
+                  cuda_graph_config=deepcopy(cuda_graph_config))
 
         prompts = [
             "Is it ok to fill diesel in a petrol car?",
@@ -798,7 +875,7 @@ def test_gqa_nemo_lora(tmp_path):
         model=model_path,
         lora_config=lora_config,
         kv_cache_config=global_kvcache_config,
-        cuda_graph_config=cuda_graph_config,
+        cuda_graph_config=deepcopy(cuda_graph_config),
     )
 
     try:

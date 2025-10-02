@@ -15,7 +15,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 from .._utils import (KVCacheEventSerializer, global_mpi_rank, global_mpi_size,
-                      mpi_comm, mpi_rank, nvtx_range_debug)
+                      mpi_comm, mpi_rank, nvtx_pytorch_emit, nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import (BaseLlmArgs, KvCacheConnectorConfig,
@@ -707,6 +707,7 @@ class GenerationExecutorWorker(GenerationExecutor):
         self.shutdown()
 
 
+@nvtx_pytorch_emit()
 @print_traceback_on_error
 def worker_main(
     engine: Path | Engine,
