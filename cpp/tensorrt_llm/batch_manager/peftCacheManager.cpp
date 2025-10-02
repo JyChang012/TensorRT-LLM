@@ -643,3 +643,5 @@ SizeType32 NoOpPeftCacheManager::determineNumPages(std::shared_ptr<LlmRequest> l
     return 0;
 }
 } // namespace tensorrt_llm::batch_manager
+
+// TODO: merge C++ LoRA caching status with Py Slot manager

@@ -1,6 +1,7 @@
 import json
 import tarfile
 import tempfile
+from copy import deepcopy
 from pathlib import Path
 from typing import OrderedDict, Type
 
@@ -11,6 +12,34 @@ from utils.util import duplicate_list_to_length, flatten_list, similar
 from tensorrt_llm import SamplingParams
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi.llm import BaseLLM
+
+
+class DelayedAssert:
+
+    def __init__(self, store_stack: bool = False):
+        self.assertions = []
+        self.store_stack = store_stack
+
+    def add(self, result: bool, msg: str):
+        import traceback
+        self.assertions.append(
+            (bool(result), str(msg), traceback.format_stack()))
+
+    def assert_all(self):
+
+        def get_msg():
+            ret = ['Some assertions failed:']
+            for result, msg, stack in self.assertions:
+                ret.append('\n'.join([
+                    f'Assert result: {result}', msg,
+                    ''.join(stack) if self.store_stack else ''
+                ]))
+            ret = '\n-----------------------------------------\n'.join(ret)
+            ret = 'Some assertions failed:\n' + ret
+            return ret
+
+        assert all(ret[0] for ret in self.assertions), get_msg()
+        self.assertions.clear()
 
 
 def check_llama_7b_multi_unique_lora_adapters_from_request(
@@ -49,6 +78,7 @@ def check_llama_7b_multi_unique_lora_adapters_from_request(
         LoRARequest(str(i), i, hf_lora_dirs[i % len(hf_lora_dirs)])
         for i in range(total_lora_adapters)
     ]
+    # lora_requests[-1] = None
     llm = llm_class(hf_model_dir, **llm_kwargs)
 
     # Perform repeats of the same requests to test reuse and reload of adapters previously unloaded from cache
@@ -57,13 +87,22 @@ def check_llama_7b_multi_unique_lora_adapters_from_request(
         for _ in range(repeat_calls):
             last_idx = 0
             for adapter_count in lora_adapter_count_per_call:
+                print(
+                    f'prompts in batch: {prompts_to_generate[last_idx:last_idx + adapter_count] * repeats_per_call}'
+                )
+                print(
+                    f'lora requests in batch: {deepcopy(lora_requests[last_idx:last_idx + adapter_count]) * repeats_per_call}'
+                )
+                print(
+                    f'references in batch: {references[last_idx:last_idx + adapter_count] * repeats_per_call}'
+                )
                 sampling_params = SamplingParams(max_tokens=20)
                 outputs = llm.generate(
                     prompts_to_generate[last_idx:last_idx + adapter_count] *
                     repeats_per_call,
                     sampling_params,
-                    lora_request=lora_requests[last_idx:last_idx +
-                                               adapter_count] *
+                    lora_request=deepcopy(
+                        lora_requests[last_idx:last_idx + adapter_count]) *
                     repeats_per_call)
                 for output, ref in zip(
                         outputs, references[last_idx:last_idx + adapter_count] *
@@ -77,6 +116,7 @@ def check_llama_7b_multi_unique_lora_adapters_from_request(
                     print(f"Output:\n{output.outputs[0].text}\n\nReference:\n{ref}")
                     '''
                 last_idx += adapter_count
+            # torch.cuda.synchronize()
         assert all(ret[0] for ret in
                    similarity_ret), f"Similarity check failed: {similarity_ret}"
     finally:
@@ -88,6 +128,23 @@ def check_llama_7b_multi_lora_from_request_test_harness(
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
     hf_lora_dir1 = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
     hf_lora_dir2 = f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
+
+    prompt_to_references = OrderedDict({
+        ("美国的首都在哪里? \n答案:", None):
+        "沃尔玛\n\n## 新闻\n\n* ",
+        ("アメリカ合衆国の首都はどこですか? \n答え:", None):
+        "Washington, D.C.\nWashington, D.C. is the capital of the United",
+        ("美国的首都在哪里? \n答案:", hf_lora_dir1):
+        "美国的首都是华盛顿。\n\n美国的",
+        ("アメリカ合衆国の首都はどこですか? \n答え:", hf_lora_dir1):
+        "华盛顿。\n\n英国の首都是什",
+        ("美国的首都在哪里? \n答案:", hf_lora_dir2):
+        "纽约\n\n### カンファレンスの",
+        ("アメリカ合衆国の首都はどこですか? \n答え:", hf_lora_dir2):
+        "ワシントン\nQ1. アメリカ合衆国",
+    })
+    list(prompt_to_references.items())
+
     prompts = [
         "美国的首都在哪里? \n答案:",
         "美国的首都在哪里? \n答案:",
@@ -115,15 +172,29 @@ def check_llama_7b_multi_lora_from_request_test_harness(
     lora_req1 = LoRARequest("luotuo", 1, hf_lora_dir1)
     lora_req2 = LoRARequest("Japanese", 2, hf_lora_dir2)
     sampling_params = SamplingParams(max_tokens=20)
+    lora_requests = [None, lora_req1, lora_req2, None, lora_req1, lora_req2]
+    '''
+    sampling_params = SamplingParams(max_tokens=20, temperature=0, top_k=1)
+
+    all_lora_requests = {hf_lora_dir1: lora_req1, hf_lora_dir2: lora_req2, None: None}
+
+    old_selected = [0, 2, 4, 1, 3, 5]
+
+    selected = old_selected
+    # selected = [2, 4, 2, 5, 3, 5]
+    # selected = [0] * 6
+    prompts = [prompts_to_references[i][0][0] for i in selected]
+    lora_requests = [prompts_to_references[i][0][1] for i in selected]
+    lora_requests = list(map(all_lora_requests.__getitem__, lora_requests))
+    lora_requests = None if all(l is None for l in lora_requests) else lora_requests
+    references = [prompts_to_references[i][1] for i in selected]
+    '''
 
     llm = llm_class(hf_model_dir, **llm_kwargs)
     try:
         outputs = llm.generate(prompts,
                                sampling_params,
-                               lora_request=[
-                                   None, lora_req1, lora_req2, None, lora_req1,
-                                   lora_req2
-                               ])
+                               lora_request=lora_requests)
         '''
         outputs = llm.generate(prompts[0],
                                sampling_params,
@@ -136,8 +207,8 @@ def check_llama_7b_multi_lora_from_request_test_harness(
     similarity_ret = []
     for output, ref, key_word in zip(outputs, references, key_words):
         similarity_ret.append([
-            similar(output.outputs[0].text, ref)
-            or key_word in output.outputs[0].text, (output.outputs[0].text, ref)
+            similar(output.outputs[0].text, ref) or False,
+            (output.outputs[0].text, ref)
         ])
         '''
         assert similar(output.outputs[0].text,

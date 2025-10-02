@@ -6,12 +6,9 @@ by maintaining a fixed number of slots for different LoRA adapters (task_ids).
 """
 
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set
 
-if TYPE_CHECKING:
-    pass
-
-    from .scheduler import ScheduledRequests
+from .scheduler import ScheduledRequests
 
 
 class AdapterSlotManager:
@@ -65,15 +62,18 @@ class AdapterSlotManager:
         """
         evicted_task = None
         if task_id in self.task2slot:
+            # logger.info(f"Task {task_id} already in slot {self.task2slot[task_id]}")
             self.task2slot.move_to_end(task_id)
         else:
             self.slots_changed = True
             if len(self.task2slot) < self.max_lora_size:
+                # logger.info(f"Task {task_id} assigned to new slot {len(self.task2slot)}")
                 self.slot2task[len(self.task2slot)] = task_id
                 self.task2slot[task_id] = len(self.task2slot)
             else:
                 # evict lru
                 evicted_task, evicted_slot = self.task2slot.popitem(last=False)
+                # logger.info(f"Task {task_id} assigned to slot {evicted_slot} and evicted task {evicted_task}")
                 self.slot2task[evicted_slot] = task_id
                 self.task2slot[task_id] = evicted_slot
         return self.task2slot[task_id], evicted_task
@@ -124,16 +124,17 @@ class AdapterSlotManager:
                 # LoRA request
                 request_to_slot_id[request_id] = task_id_to_slot_id[task_id]
 
+        # print(f'slot2task: {self.slot2task}')
         return request_to_slot_id
 
-    def get_slot_to_task_mapping(self) -> Dict[int, Optional[int]]:
+    def get_slot_to_task_mapping(self) -> tuple[Optional[int], ...]:
         """
         Get current slot to task mapping.
 
         Returns:
-            Dict mapping slot_id to task_id (or None if slot is empty)
+            Tuple mapping slot_id to task_id (or None if slot is empty)
         """
-        return {sid: tid for sid, tid in enumerate(self.slot2task)}
+        return tuple(self.slot2task)
 
     def has_slots_changed(self) -> bool:
         """Check if slot assignments have changed since last check."""
