@@ -6,9 +6,10 @@ by maintaining a fixed number of slots for different LoRA adapters (task_ids).
 """
 
 from collections import OrderedDict
-from typing import Dict, List, Optional, Set
+from typing import List, Optional
 
-from .scheduler import ScheduledRequests
+from .resource_manager import PeftCacheManager
+from .scheduler import RequestList
 
 
 class AdapterSlotManager:
@@ -38,23 +39,23 @@ class AdapterSlotManager:
         # State tracking
         self.slots_changed = False
 
-    def get_or_assign_slots(self, batch_task_ids: Set[int]) -> Dict[int, int]:
+    def find_free_slot(self) -> int:
         """
-        Get slot assignments for a batch, updating slots if necessary.
-
-        Args:
-            batch_task_ids: Set of task_ids needed for the current batch
-
-        Returns:
-            Dict mapping task_id to slot_id for all task_ids in the batch
+        Find a free slot. Return slot_id if found, otherwise return None.
         """
-        ret = dict()
-        for task_id in batch_task_ids:
-            slot, _ = self.get_or_assign_slot(task_id)
-            ret[task_id] = slot
-        return ret
+        return self.slot2task.index(None)
 
-    def get_or_assign_slot(self, task_id: int) -> tuple[int, Optional[int]]:
+    def remove_task(self, task_id: int) -> Optional[int]:
+        """
+        Remove a task_id from slots. Return its slot_id if present otherwise return None.
+        """
+        slot_id = self.task2slot.pop(task_id, default=None)
+        if slot_id is not None:
+            self.slots_changed = True
+            self.slot2task[slot_id] = None
+        return slot_id
+
+    def get_or_assign_task(self, task_id: int) -> tuple[int, Optional[int]]:
         """
         Assign a task_id to a slot and do LRU eviction if necessary.
         If already in any slot, update LRU order.
@@ -68,8 +69,9 @@ class AdapterSlotManager:
             self.slots_changed = True
             if len(self.task2slot) < self.max_lora_size:
                 # logger.info(f"Task {task_id} assigned to new slot {len(self.task2slot)}")
-                self.slot2task[len(self.task2slot)] = task_id
-                self.task2slot[task_id] = len(self.task2slot)
+                free_slot = self.find_free_slot()
+                self.slot2task[free_slot] = task_id
+                self.task2slot[task_id] = free_slot
             else:
                 # evict lru
                 evicted_task, evicted_slot = self.task2slot.popitem(last=False)
@@ -78,8 +80,17 @@ class AdapterSlotManager:
                 self.task2slot[task_id] = evicted_slot
         return self.task2slot[task_id], evicted_task
 
-    def get_slot_mapping_for_batch(
-            self, scheduled_requests: "ScheduledRequests") -> Dict[int, int]:
+    def remove_evicted_slots_in_cpp(self, peft_cache_manager: PeftCacheManager):
+        """
+        Validate slots by removing tasks that are not cached in PeftCacheManager.
+        """
+        for task_id in self.slot2task:
+            if task_id is not None:
+                if not peft_cache_manager.is_task_cached_device(task_id):
+                    self.remove_task(task_id)
+
+    def update_slots(self, requests: RequestList,
+                     peft_cache_manager: PeftCacheManager) -> list[int]:
         """
         Get slot mapping for all requests in a scheduled batch.
 
@@ -89,43 +100,25 @@ class AdapterSlotManager:
         Returns:
             Dict mapping request_id to slot_id, with slot_id=max_lora_size for base model requests
         """
-        # Collect all task_ids from requests
-        batch_task_ids = set()
-        request_to_task_id = {}
+        # remove task evicted in PeftCacheManager in C++
+        self.remove_evicted_slots_in_cpp(peft_cache_manager)
 
-        all_requests = scheduled_requests.context_requests + scheduled_requests.generation_requests
-
-        for request in all_requests:
-            if hasattr(request,
-                       'lora_task_id') and request.lora_task_id is not None:
-                task_id = int(request.lora_task_id)
-                batch_task_ids.add(task_id)
-                request_to_task_id[request.py_request_id] = task_id
-            else:
-                # Base model request - use special marker (no task_id)
-                request_to_task_id[request.py_request_id] = None
+        # check if total number of unique tasks in the requests is not larger than max_lora_size
+        tasks = [request.lora_task_id for request in requests]
+        unique_tasks = {t for t in tasks if t is not None}
         assert len(
-            batch_task_ids
+            unique_tasks
         ) <= self.max_lora_size, "Currently do not support batch with more LoRA task ID than loRA slot size!"
 
-        # Get slot assignments for non-base-model task_ids
-        if batch_task_ids:
-            task_id_to_slot_id = self.get_or_assign_slots(batch_task_ids)
-        else:
-            task_id_to_slot_id = {}
-
-        # Map request_ids to slot_ids
-        request_to_slot_id = {}
-        for request_id, task_id in request_to_task_id.items():
-            if task_id is None:
-                # Base model request - use slot_id = max_lora_size (dummy slot)
-                request_to_slot_id[request_id] = self.max_lora_size
+        # assign slots to tasks
+        for i, task in enumerate(tasks):
+            if task is None:
+                tasks[i] = self.max_lora_size
             else:
-                # LoRA request
-                request_to_slot_id[request_id] = task_id_to_slot_id[task_id]
+                tasks[i], evicted_task = self.get_or_assign_task(task)
+                assert evicted_task is None, f"Task {task} evicted, but have to evict task in Python AdapterSlotManager."
 
-        # print(f'slot2task: {self.slot2task}')
-        return request_to_slot_id
+        return tasks
 
     def get_slot_to_task_mapping(self) -> tuple[Optional[int], ...]:
         """

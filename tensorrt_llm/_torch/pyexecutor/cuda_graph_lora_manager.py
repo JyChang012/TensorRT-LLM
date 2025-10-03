@@ -9,8 +9,6 @@ from typing import Dict, Optional
 
 import torch
 
-from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
-
 from ..._utils import nvtx_range
 from ...logger import logger
 from ...lora_manager import LoraManager, LoraModelConfig
@@ -18,6 +16,7 @@ from ..attention_backend.interface import AttentionMetadata
 from ..peft.lora.layer import LoraLayer
 from .adapter_slot_manager import AdapterSlotManager
 from .cuda_graph_lora_params import CudaGraphLoraParams
+from .resource_manager import PeftCacheManager
 from .scheduler import ScheduledRequests
 
 
@@ -129,8 +128,7 @@ class CudaGraphLoraManager:
     def prepare_cuda_graph_lora_params(
             self, scheduled_requests: "ScheduledRequests",
             attn_metadata: "AttentionMetadata",
-            peft_table: Dict[int,
-                             list[TaskLayerModuleConfig]]) -> Optional[Dict]:
+            peft_cache_manager: PeftCacheManager) -> Optional[Dict]:
         """
         Prepare CUDA Graph compatible LoRA parameters from scheduled requests.
 
@@ -148,26 +146,22 @@ class CudaGraphLoraManager:
         assert len(
             scheduled_requests.context_requests
         ) == 0, f"Context requests are not supported with LoRA CUDA Graph path. Have {len(scheduled_requests.context_requests)} context requests"
-        request_list = scheduled_requests.context_requests + scheduled_requests.generation_requests
+        request_list = scheduled_requests.generation_requests
 
         batch_size = len(request_list)
+        peft_table = peft_cache_manager.get_and_reset_batch_peft_table()
 
         # logger.info(f"num gen requests: {len(scheduled_requests.generation_requests)}, request_id: {[req.py_request_id for req in scheduled_requests.generation_requests]}")
         # Get slot assignments for this batch
-        request_to_slot_id = self.adapter_slot_manager.get_slot_mapping_for_batch(
-            scheduled_requests)
+        request_slot_ids = self.adapter_slot_manager.update_slots(
+            request_list, peft_cache_manager)
 
         # print(f"request_id_to_slot_id: {request_to_slot_id}")
 
-        # Update slot IDs in lora_params
-        slot_ids_list = [
-            request_to_slot_id.get(req.py_request_id, self.max_lora_size)
-            for req in request_list
-        ]
-        # logger.info(f"slot_ids_list: {slot_ids_list}")
+        # logger.info(f"request_slot_ids: {request_slot_ids}")
         cuda_graph_lora_params = self.cuda_graph_lora_params
-        cuda_graph_lora_params.update_slot_ids(slot_ids_list, batch_size)
-        slot_counts = torch.bincount(torch.tensor(slot_ids_list,
+        cuda_graph_lora_params.update_slot_ids(request_slot_ids, batch_size)
+        slot_counts = torch.bincount(torch.tensor(request_slot_ids,
                                                   dtype=torch.int32),
                                      minlength=self.max_lora_size)
         assert slot_counts.size(0) <= self.max_lora_size + 1

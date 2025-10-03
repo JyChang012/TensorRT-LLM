@@ -64,7 +64,8 @@ from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import get_draft_token_length
 from .resource_manager import (BaseResourceManager, KVCacheManager,
-                               ResourceManager, ResourceManagerType)
+                               PeftCacheManager, ResourceManager,
+                               ResourceManagerType)
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
@@ -1292,6 +1293,7 @@ class PyTorchModelEngine(ModelEngine):
             self,
             scheduled_requests: ScheduledRequests,
             kv_cache_manager: KVCacheManager,
+            peft_cache_manager: PeftCacheManager,
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
@@ -1661,7 +1663,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.prepare()
 
         lora_params = self._get_lora_params_from_requests(
-            scheduled_requests, attn_metadata, maybe_graph)
+            scheduled_requests, attn_metadata, peft_cache_manager, maybe_graph)
 
         attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
         padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
@@ -2110,6 +2112,7 @@ class PyTorchModelEngine(ModelEngine):
     def _get_lora_params_from_requests(self,
                                        scheduled_requests: ScheduledRequests,
                                        attn_metadata: AttentionMetadata,
+                                       peft_cache_manager: PeftCacheManager,
                                        maybe_graph: bool = False):
         '''
         Get LoRA parameters from scheduled requests.
@@ -2126,22 +2129,17 @@ class PyTorchModelEngine(ModelEngine):
         # gen_tasks = {request.lora_task_id for request in scheduled_requests.generation_requests if request.lora_task_id is not None}
         # print(f'ctx_tasks ({len(scheduled_requests.context_requests)}): {ctx_tasks}')
         # print(f'gen_tasks ({len(scheduled_requests.generation_requests)}): {gen_tasks}')
-        peft_table = dict()
-        request_list = scheduled_requests.context_requests + scheduled_requests.generation_requests
-
-        for request in request_list:
-            if (hasattr(request, 'py_lora_task_layer_module_configs')
-                    and request.py_lora_task_layer_module_configs):
-                peft_table = request.py_lora_task_layer_module_configs
-                break
 
         if use_cuda_graph_mode:
             # Get PEFT table from request's py_lora_task_layer_module_configs
             # Since all requests with the same task_id have the same layer-module-configs,
             # we can extract it from any request that has LoRA configurations
             return self.cuda_graph_lora_manager.prepare_cuda_graph_lora_params(
-                scheduled_requests, attn_metadata, peft_table)
+                scheduled_requests, attn_metadata, peft_cache_manager)
         else:
+            self.cuda_graph_lora_manager.adapter_slot_manager.remove_evicted_slots_in_cpp(
+                peft_cache_manager)
+            peft_table = peft_cache_manager.get_and_reset_batch_peft_table()
             return self._get_legacy_lora_params_from_requests(
                 scheduled_requests, attn_metadata, peft_table)
 
@@ -2248,6 +2246,7 @@ class PyTorchModelEngine(ModelEngine):
     def _prepare_inputs(self,
                         scheduled_requests: ScheduledRequests,
                         kv_cache_manager: KVCacheManager,
+                        peft_cache_manager: PeftCacheManager,
                         attn_metadata: AttentionMetadata,
                         spec_metadata: Optional[SpecMetadata] = None,
                         new_tensors_device: Optional[SampleStateTensors] = None,
@@ -2262,8 +2261,8 @@ class PyTorchModelEngine(ModelEngine):
                 assert False, f'Unsupport cp_type {cp_type}'
         else:
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
-                                           attn_metadata, spec_metadata,
-                                           new_tensors_device,
+                                           peft_cache_manager, attn_metadata,
+                                           spec_metadata, new_tensors_device,
                                            cache_indirection_buffer,
                                            maybe_graph)
 
@@ -2281,6 +2280,8 @@ class PyTorchModelEngine(ModelEngine):
         # torch.cuda.current_stream().synchronize()   # pass
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
+        peft_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.PEFT_CACHE_MANAGER)
 
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
         if self.enable_spec_decode:
@@ -2340,8 +2341,9 @@ class PyTorchModelEngine(ModelEngine):
                     spec_metadata = None
             # torch.cuda.current_stream().synchronize()   # pass
             inputs, gather_ids = self._prepare_inputs(
-                padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
-                new_tensors_device, cache_indirection_buffer, maybe_graph)
+                padded_requests, kv_cache_manager, peft_cache_manager,
+                attn_metadata, spec_metadata, new_tensors_device,
+                cache_indirection_buffer, maybe_graph)
 
             self.iter_counter += 1
             '''
