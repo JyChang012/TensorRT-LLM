@@ -122,69 +122,90 @@ void cuda_graph_grouped_gemm_template(cutlass::gemm::GemmCoord* problem_sizes_pt
     TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "Failed to execute grouped GEMM");
 }
 
+template <int M1, int N1, int K1, int M2, int N2, int K2, int kAlignmentAB, int kAlignmentC, int kStages>
+void cuda_graph_grouped_gemm_type(cutlass::gemm::GemmCoord* problem_sizes_ptr, int problem_count, void** ptrA_gpu,
+    void** ptrB_gpu, void** ptrC_gpu, void** ptrD_gpu, int64_t* lda_gpu, int64_t* ldb_gpu, int64_t* ldc_gpu,
+    int64_t* ldd_gpu, void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, nvinfer1::DataType dataType,
+    cudaStream_t stream)
+{
+    if (dataType == nvinfer1::DataType::kHALF)
+    {
+        cuda_graph_grouped_gemm_template<M1, N1, K1, M2, N2, K2, cutlass::half_t, kAlignmentAB, kAlignmentC, kStages>(
+            problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
+            ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
+    }
+#ifdef ENABLE_BF16
+    else if (dataType == nvinfer1::DataType::kBF16)
+    {
+        cuda_graph_grouped_gemm_template<M1, N1, K1, M2, N2, K2, cutlass::bfloat16_t, kAlignmentAB, kAlignmentC,
+            kStages>(problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu,
+            ldc_gpu, ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
+    }
+#endif
+    else
+    {
+        TLLM_CHECK_WITH_INFO(false, "Unsupported data type for CUDA Graph grouped GEMM");
+    }
+}
+
 void cuda_graph_grouped_gemm(cutlass::gemm::GemmCoord* problem_sizes_ptr, int problem_count, void** ptrA_gpu,
     void** ptrB_gpu, void** ptrC_gpu, void** ptrD_gpu, int64_t* lda_gpu, int64_t* ldb_gpu, int64_t* ldc_gpu,
     int64_t* ldd_gpu, void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, bool isLoraIn,
     nvinfer1::DataType dataType, int minKN, cudaStream_t stream)
 {
-    // Based on the original groupGemm.cu logic for kernel selection
-    if (dataType == nvinfer1::DataType::kHALF)
+    if (isLoraIn)
     {
         if (minKN >= 8)
         {
-            cuda_graph_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 8, 4>(problem_sizes_ptr,
-                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
-                gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
+            cuda_graph_grouped_gemm_type<16, 32, 64, 16, 32, 64, 8, 8, 4>(problem_sizes_ptr, problem_count, ptrA_gpu,
+                ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, dataType, stream);
         }
         else if (minKN >= 4)
         {
-            cuda_graph_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 4, 4>(problem_sizes_ptr,
-                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
-                gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
+            cuda_graph_grouped_gemm_type<16, 32, 64, 16, 32, 64, 8, 4, 4>(problem_sizes_ptr, problem_count, ptrA_gpu,
+                ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, dataType, stream);
         }
         else if (minKN >= 2)
         {
-            cuda_graph_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 2, 2>(problem_sizes_ptr,
-                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
-                gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
+            cuda_graph_grouped_gemm_type<16, 32, 64, 16, 32, 64, 8, 2, 2>(problem_sizes_ptr, problem_count, ptrA_gpu,
+                ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, dataType, stream);
         }
         else if (minKN >= 1)
         {
-            cuda_graph_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 1, 1, 2>(problem_sizes_ptr,
-                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
-                gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
-        }
-    }
-    else if (dataType == nvinfer1::DataType::kBF16)
-    {
-        if (minKN >= 8)
-        {
-            cuda_graph_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::bfloat16_t, 8, 8, 4>(problem_sizes_ptr,
-                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
-                gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
-        }
-        else if (minKN >= 4)
-        {
-            cuda_graph_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::bfloat16_t, 8, 4, 4>(problem_sizes_ptr,
-                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
-                gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
-        }
-        else if (minKN >= 2)
-        {
-            cuda_graph_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::bfloat16_t, 8, 2, 2>(problem_sizes_ptr,
-                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
-                gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
-        }
-        else if (minKN >= 1)
-        {
-            cuda_graph_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::bfloat16_t, 1, 1, 2>(problem_sizes_ptr,
-                problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu,
-                gemmExecutionWorkspace, gemmExecutionWorkspaceSize, stream);
+            cuda_graph_grouped_gemm_type<16, 32, 64, 16, 32, 64, 8, 1, 2>(problem_sizes_ptr, problem_count, ptrA_gpu,
+                ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, dataType, stream);
         }
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(false, "Unsupported data type for CUDA Graph grouped GEMM");
+        if (minKN >= 8)
+        {
+            cuda_graph_grouped_gemm_type<32, 128, 32, 32, 32, 32, 8, 8, 4>(problem_sizes_ptr, problem_count, ptrA_gpu,
+                ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, dataType, stream);
+        }
+        else if (minKN >= 4)
+        {
+            cuda_graph_grouped_gemm_type<32, 128, 32, 32, 32, 32, 4, 8, 4>(problem_sizes_ptr, problem_count, ptrA_gpu,
+                ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, dataType, stream);
+        }
+        else if (minKN >= 2)
+        {
+            cuda_graph_grouped_gemm_type<32, 128, 32, 32, 32, 32, 2, 8, 2>(problem_sizes_ptr, problem_count, ptrA_gpu,
+                ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, dataType, stream);
+        }
+        else
+        {
+            cuda_graph_grouped_gemm_type<32, 128, 32, 32, 32, 32, 1, 8, 2>(problem_sizes_ptr, problem_count, ptrA_gpu,
+                ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, dataType, stream);
+        }
     }
 }
 
@@ -286,121 +307,102 @@ void cuda_graph_splitk_grouped_gemm_template(cutlass::gemm::GemmCoord* problem_s
         splitKSlices, cutlass::cutlassGetStatusString(status));
 }
 
+template <int M1, int N1, int K1, int M2, int N2, int K2, int kAlignmentAB, int kAlignmentC, int kStages>
+void cuda_graph_splitk_grouped_gemm_type(cutlass::gemm::GemmCoord* problem_sizes_ptr, int problem_count,
+    void** ptrA_gpu, void** ptrB_gpu, void** ptrC_gpu, void** ptrD_gpu, int64_t* lda_gpu, int64_t* ldb_gpu,
+    int64_t* ldc_gpu, int64_t* ldd_gpu, void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize,
+    nvinfer1::DataType dataType, int splitKSlices, cutlass::gemm::GemmCoord* host_max_problem_sizes_ptr,
+    int64_t* splitk_offsets_gpu, cudaStream_t stream)
+{
+    if (dataType == nvinfer1::DataType::kHALF)
+    {
+        cuda_graph_splitk_grouped_gemm_template<M1, N1, K1, M2, N2, K2, cutlass::half_t, kAlignmentAB, kAlignmentC,
+            kStages>(problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu,
+            ldc_gpu, ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices,
+            host_max_problem_sizes_ptr, splitk_offsets_gpu, stream);
+    }
+#ifdef ENABLE_BF16
+    else if (dataType == nvinfer1::DataType::kBF16)
+    {
+        cuda_graph_splitk_grouped_gemm_template<M1, N1, K1, M2, N2, K2, cutlass::bfloat16_t, kAlignmentAB, kAlignmentC,
+            kStages>(problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu,
+            ldc_gpu, ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices,
+            host_max_problem_sizes_ptr, splitk_offsets_gpu, stream);
+    }
+#endif
+    else
+    {
+        TLLM_CHECK_WITH_INFO(false, "Unsupported data type for CUDA Graph split-K grouped GEMM");
+    }
+}
+
 void cuda_graph_splitk_grouped_gemm(cutlass::gemm::GemmCoord* problem_sizes_ptr, int problem_count, void** ptrA_gpu,
     void** ptrB_gpu, void** ptrC_gpu, void** ptrD_gpu, int64_t* lda_gpu, int64_t* ldb_gpu, int64_t* ldc_gpu,
     int64_t* ldd_gpu, void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, bool isLoraIn,
     nvinfer1::DataType dataType, int splitKSlices, int minKN, cutlass::gemm::GemmCoord* host_max_problem_sizes_ptr,
     int64_t* splitk_offsets_gpu, cudaStream_t stream)
 {
-    // Based on splitkGroupGemm.cu logic for kernel selection
-    if (dataType == nvinfer1::DataType::kHALF)
+    if (isLoraIn)
     {
-        if (isLoraIn)
+        if (minKN >= 8)
         {
-            // K >> N, like K = 1024, N = 8
-            if (minKN >= 8)
-            {
-                cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 8, 4>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
-                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices,
-                    host_max_problem_sizes_ptr, splitk_offsets_gpu, stream);
-            }
-            else if (minKN >= 4)
-            {
-                cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 4, 4>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
-                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices,
-                    host_max_problem_sizes_ptr, splitk_offsets_gpu, stream);
-            }
-            else if (minKN >= 2)
-            {
-                cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 2, 2>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
-                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices,
-                    host_max_problem_sizes_ptr, splitk_offsets_gpu, stream);
-            }
-            else
-            {
-                cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::half_t, 8, 1, 2>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
-                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices,
-                    host_max_problem_sizes_ptr, splitk_offsets_gpu, stream);
-            }
+            cuda_graph_splitk_grouped_gemm_type<16, 32, 64, 16, 32, 64, 8, 8, 4>(problem_sizes_ptr, problem_count,
+                ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, dataType, splitKSlices, host_max_problem_sizes_ptr, splitk_offsets_gpu,
+                stream);
         }
-        else
+        else if (minKN >= 4)
         {
-            // N >> K, like K = 8, N = 1024
-            if (minKN >= 8)
-            {
-                cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::half_t, 8, 8, 4>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
-                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices,
-                    host_max_problem_sizes_ptr, splitk_offsets_gpu, stream);
-            }
-            else if (minKN >= 4)
-            {
-                cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::half_t, 4, 8, 4>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
-                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices,
-                    host_max_problem_sizes_ptr, splitk_offsets_gpu, stream);
-            }
-            else if (minKN >= 2)
-            {
-                cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::half_t, 2, 8, 2>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
-                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices,
-                    host_max_problem_sizes_ptr, splitk_offsets_gpu, stream);
-            }
-            else
-            {
-                cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::half_t, 1, 8, 2>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
-                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices,
-                    host_max_problem_sizes_ptr, splitk_offsets_gpu, stream);
-            }
+            cuda_graph_splitk_grouped_gemm_type<16, 32, 64, 16, 32, 64, 8, 4, 4>(problem_sizes_ptr, problem_count,
+                ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, dataType, splitKSlices, host_max_problem_sizes_ptr, splitk_offsets_gpu,
+                stream);
         }
-    }
-    else if (dataType == nvinfer1::DataType::kBF16)
-    {
-        // Similar template instantiations for bfloat16
-        if (isLoraIn)
+        else if (minKN >= 2)
         {
-            if (minKN >= 8)
-            {
-                cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::bfloat16_t, 8, 8, 4>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
-                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices,
-                    host_max_problem_sizes_ptr, splitk_offsets_gpu, stream);
-            }
-            else
-            {
-                cuda_graph_splitk_grouped_gemm_template<16, 32, 64, 16, 32, 64, cutlass::bfloat16_t, 8, 1, 2>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
-                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices,
-                    host_max_problem_sizes_ptr, splitk_offsets_gpu, stream);
-            }
+            cuda_graph_splitk_grouped_gemm_type<16, 32, 64, 16, 32, 64, 8, 2, 2>(problem_sizes_ptr, problem_count,
+                ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, dataType, splitKSlices, host_max_problem_sizes_ptr, splitk_offsets_gpu,
+                stream);
         }
-        else
+        else if (minKN >= 1)
         {
-            if (minKN >= 8)
-            {
-                cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::bfloat16_t, 8, 8, 4>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
-                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices,
-                    host_max_problem_sizes_ptr, splitk_offsets_gpu, stream);
-            }
-            else
-            {
-                cuda_graph_splitk_grouped_gemm_template<32, 128, 32, 32, 32, 32, cutlass::bfloat16_t, 1, 8, 2>(
-                    problem_sizes_ptr, problem_count, ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu,
-                    ldd_gpu, gemmExecutionWorkspace, gemmExecutionWorkspaceSize, splitKSlices,
-                    host_max_problem_sizes_ptr, splitk_offsets_gpu, stream);
-            }
+            cuda_graph_splitk_grouped_gemm_type<16, 32, 64, 16, 32, 64, 8, 1, 2>(problem_sizes_ptr, problem_count,
+                ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, dataType, splitKSlices, host_max_problem_sizes_ptr, splitk_offsets_gpu,
+                stream);
         }
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(false, "Unsupported data type for CUDA Graph split-K grouped GEMM");
+        if (minKN >= 8)
+        {
+            cuda_graph_splitk_grouped_gemm_type<32, 128, 32, 32, 32, 32, 8, 8, 4>(problem_sizes_ptr, problem_count,
+                ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, dataType, splitKSlices, host_max_problem_sizes_ptr, splitk_offsets_gpu,
+                stream);
+        }
+        else if (minKN >= 4)
+        {
+            cuda_graph_splitk_grouped_gemm_type<32, 128, 32, 32, 32, 32, 4, 8, 4>(problem_sizes_ptr, problem_count,
+                ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, dataType, splitKSlices, host_max_problem_sizes_ptr, splitk_offsets_gpu,
+                stream);
+        }
+        else if (minKN >= 2)
+        {
+            cuda_graph_splitk_grouped_gemm_type<32, 128, 32, 32, 32, 32, 2, 8, 2>(problem_sizes_ptr, problem_count,
+                ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, dataType, splitKSlices, host_max_problem_sizes_ptr, splitk_offsets_gpu,
+                stream);
+        }
+        else if (minKN >= 1)
+        {
+            cuda_graph_splitk_grouped_gemm_type<32, 128, 32, 32, 32, 32, 1, 8, 2>(problem_sizes_ptr, problem_count,
+                ptrA_gpu, ptrB_gpu, ptrC_gpu, ptrD_gpu, lda_gpu, ldb_gpu, ldc_gpu, ldd_gpu, gemmExecutionWorkspace,
+                gemmExecutionWorkspaceSize, dataType, splitKSlices, host_max_problem_sizes_ptr, splitk_offsets_gpu,
+                stream);
+        }
     }
 }
 

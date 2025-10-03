@@ -289,6 +289,9 @@ class LoraLayer(torch.nn.Module):
                                     total_output_size,
                                     dtype=x.dtype,
                                     device=x.device)
+        min_kn = min(
+            hidden_size, 8, max_rank
+        )  # TODO: hardcode to 8 for now, for alignments in kernels, might have alignment error if rank is less than 8!
         if RETURN_0_DIRECTLY:
             return output_buffer
 
@@ -713,31 +716,12 @@ class LoraLayer(torch.nn.Module):
                                   dtype=self.PTR_DTYPE,
                                   device=x.device)
 
-            fake_output = torch.ops.trtllm.lora_grouped_gemm_cuda_graph(
-                a0,
-                problem_sizes1,
-                problem_sizes2,
-                a0_ptr,
-                b0_ptr,
-                d0_ptr,
-                b1_ptr,
-                d1_ptr,
-                # cuda_graph_params.slot_ids,  # Slot IDs (for reference)
-                a0,  # TODO: remove
-                cuda_graph_params.
-                sorted_ids[:batch_size],  # Sorted indices for gather/scatter
-                problem_sizes1.shape[0],
-                intermediate_buffer,
-                output_buffer,
-                lda,
-                ldb,
-                ldd,
-                ldb1,
-                ldd1,
-                host_max_in_sizes,
-                host_max_out_sizes,
-                splitk_offsets,
-            )
+            torch.ops.trtllm.lora_grouped_gemm_cuda_graph(
+                problem_sizes1, problem_sizes2, a0_ptr, b0_ptr, d0_ptr, b1_ptr,
+                d1_ptr, problem_sizes1.shape[0], lda, ldb, ldd, ldb1, ldd1,
+                host_max_in_sizes, host_max_out_sizes, splitk_offsets, a0.dtype,
+                torch.minimum(problem_sizes1[:, 1],
+                              problem_sizes1[:, 2]).min().item())
 
             print(f'd00 (2): {d00[:10, :10]}')
             print(f'd01 (0): {d01[:10, :10]}')
@@ -749,37 +733,13 @@ class LoraLayer(torch.nn.Module):
             return 0
         else:
             if GROUPED_GEMM and PARAM_PREP:
-                lora_outputs = torch.ops.trtllm.lora_grouped_gemm_cuda_graph(
-                    reordered_input,  # Input tensor
-                    in_sizes,  # GEMM sizes for lora_in
-                    out_sizes,  # GEMM sizes for lora_out
-                    a_offset,  # Input offsets
-                    layer_params.d_b_ptrs,  # Lora_in weight pointers
-                    # fake_b_ptrs,
-                    # b_ptrs,
-                    d_offset,  # Intermediate output offsets
-                    layer_params.d_b_prime_ptrs,  # Lora_out weight pointers
-                    # fake_b_prime_ptrs,
-                    # b2_ptrs,
-                    d_prime_offset,  # Final output offsets
-                    # cuda_graph_params.slot_ids,  # Slot IDs (for reference)
-                    reordered_input,
-                    cuda_graph_params.
-                    sorted_ids[:
-                               batch_size],  # Sorted indices for gather/scatter
-                    cuda_graph_params.get_problem_count(
-                        layer_key),  # Number of GEMM problems
-                    intermediate_buffer,  # Intermediate buffer (LoRA only)
-                    output_buffer,  # Output buffer (all tokens)
-                    lda,  # Leading dimensions for A matrices
-                    ldb,  # Leading dimensions for B matrices
-                    ldd,  # Leading dimensions for C matrices (reusing d_ld_d as placeholder)
-                    ldb_prime,
-                    ldd_prime,
-                    host_max_in_sizes,
-                    host_max_out_sizes,
-                    splitk_offsets,
-                )
+                torch.ops.trtllm.lora_grouped_gemm_cuda_graph(
+                    in_sizes, out_sizes, a_offset, layer_params.d_b_ptrs,
+                    d_offset, layer_params.d_b_prime_ptrs, d_prime_offset,
+                    cuda_graph_params.get_problem_count(layer_key), lda, ldb,
+                    ldd, ldb_prime, ldd_prime, host_max_in_sizes,
+                    host_max_out_sizes, splitk_offsets, reordered_input.dtype,
+                    min_kn)
             # assert lora_outputs.data_ptr() == output_buffer.data_ptr()
             '''
             restored_output = output_buffer
