@@ -37,8 +37,6 @@ namespace kernels
  * @param ptrB_gpu GPU pointer to array of B matrix pointers
  * @param ptrC_gpu GPU pointer to array of C matrix pointers (can be nullptr)
  * @param ptrD_gpu GPU pointer to array of D matrix pointers
- * @param gemmExecutionWorkspace GPU workspace for GEMM execution only
- * @param gemmExecutionWorkspaceSize Size of GEMM execution workspace
  * @param isLoraIn Whether this is for LoRA input transformation
  * @param dataType Data type of the matrices
  * @param minKN Minimum K*N value for kernel selection
@@ -46,8 +44,8 @@ namespace kernels
  */
 void cuda_graph_grouped_gemm(cutlass::gemm::GemmCoord* problem_sizes_ptr, int problem_count, void** ptrA_gpu,
     void** ptrB_gpu, void** ptrC_gpu, void** ptrD_gpu, int64_t* lda_gpu, int64_t* ldb_gpu, int64_t* ldc_gpu,
-    int64_t* ldd_gpu, void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, bool isLoraIn,
-    nvinfer1::DataType dataType, int minKN, cudaStream_t stream);
+    int64_t* ldd_gpu, bool isLoraIn, nvinfer1::DataType dataType, int minKN,
+    cutlass::gemm::GemmCoord* host_max_problem_sizes_ptr, cudaStream_t stream);
 
 /**
  * @brief CUDA Graph compatible wrapper for split-K grouped GEMM operations.
@@ -57,9 +55,8 @@ void cuda_graph_grouped_gemm(cutlass::gemm::GemmCoord* problem_sizes_ptr, int pr
  */
 void cuda_graph_splitk_grouped_gemm(cutlass::gemm::GemmCoord* problem_sizes_ptr, int problem_count, void** ptrA_gpu,
     void** ptrB_gpu, void** ptrC_gpu, void** ptrD_gpu, int64_t* lda_gpu, int64_t* ldb_gpu, int64_t* ldc_gpu,
-    int64_t* ldd_gpu, void* gemmExecutionWorkspace, int64_t gemmExecutionWorkspaceSize, bool isLoraIn,
-    nvinfer1::DataType dataType, int splitKSlices, int minKN, cutlass::gemm::GemmCoord* host_max_problem_sizes_ptr,
-    int64_t* splitk_offsets_gpu, cudaStream_t stream);
+    int64_t* ldd_gpu, bool isLoraIn, nvinfer1::DataType dataType, int splitKSlices, int minKN,
+    cutlass::gemm::GemmCoord* host_max_problem_sizes_ptr, int64_t* splitk_offsets_gpu, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

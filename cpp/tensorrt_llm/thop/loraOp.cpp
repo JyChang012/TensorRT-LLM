@@ -246,11 +246,6 @@ void lora_grouped_gemm_cuda_graph(th::Tensor const& lora_in_sizes, // [layer_mod
     default: TORCH_CHECK(false, "Invalid dtype, only supports float16, bfloat16, got %s", c10::toString(dtype));
     }
 
-    // Calculate workspace size - only need execution workspace, no parameter workspace
-    size_t execution_workspace_size = 8 * 1024 * 1024; // TODO: hardcode for now, 8MB for GEMM execution
-    auto execution_workspace
-        = torch::empty({static_cast<int64_t>(execution_workspace_size)}, a_offsets.options().dtype(torch::kUInt8));
-
     int const minKnInt = std::max(1, static_cast<int>(minKN));
 
     // Step 6: Call CUDA Graph compatible grouped GEMM for lora_in (split-K)
@@ -258,27 +253,15 @@ void lora_grouped_gemm_cuda_graph(th::Tensor const& lora_in_sizes, // [layer_mod
     if (problem_count > 0)
     {
         TLLM_LOG_TRACE("Start Grouped GEMM for LoRA in.");
+
         tk::cuda_graph_splitk_grouped_gemm(problem_sizes_1_ptr, problem_count, a_ptrs_gpu, b_ptrs_gpu,
             d_ptrs_gpu,                                     // ptrC (no bias)
             d_ptrs_gpu, lda_gpu, ldb_gpu, ldd_gpu, ldd_gpu, // Precomputed leading dimensions
-            execution_workspace.data_ptr(),                 // Only execution workspace needed
-            execution_workspace_size,
             true,                                           // isLoraIn
             loraRuntimeDataType,
             16,                                             // splitKSlices
             minKnInt,                                       // minKN
             host_max_in_sizes_ptr, splitk_offsets_gpu, stream);
-        /*
-        tk::cuda_graph_grouped_gemm(problem_sizes_1_ptr, problem_count, a_ptrs_gpu, b_ptrs_gpu,
-            d_ptrs_gpu,                                     // ptrC (no bias)
-            d_ptrs_gpu, lda_gpu, ldb_gpu, ldd_gpu, ldd_gpu, // Precomputed leading dimensions
-            execution_workspace.data_ptr(),                 // Only execution workspace needed
-            execution_workspace_size,
-            true,                                           // isLoraIn
-            loraRuntimeDataType,
-            1,                                              // minKN
-            stream);
-        */
         sync_check_cuda_error(stream);
     }
 
@@ -289,12 +272,10 @@ void lora_grouped_gemm_cuda_graph(th::Tensor const& lora_in_sizes, // [layer_mod
         tk::cuda_graph_grouped_gemm(problem_sizes_2_ptr, problem_count, a_prime_ptrs_gpu, b_prime_ptrs_gpu,
             d_prime_ptrs_gpu,                                                       // ptrC (no bias)
             d_prime_ptrs_gpu, ldd_gpu, ldb_prime_gpu, ldd_prime_gpu, ldd_prime_gpu, // Precomputed leading dimensions
-            execution_workspace.data_ptr(),                                         // Only execution workspace needed
-            execution_workspace_size,
             false,                                                                  // isLoraIn
             loraRuntimeDataType,
             minKnInt,                                                               // minKN
-            stream);
+            host_max_out_sizes_ptr, stream);
         sync_check_cuda_error(stream);
     }
 
