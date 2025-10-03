@@ -116,7 +116,6 @@ class AdapterSlotManager:
                 tasks[i] = self.max_lora_size
             else:
                 tasks[i], evicted_task = self.get_or_assign_task(task)
-                assert evicted_task is None, f"Task {task} evicted, but have to evict task in Python AdapterSlotManager."
 
         return tasks
 

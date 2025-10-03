@@ -3,7 +3,6 @@ from typing import Dict, List, Optional
 
 import torch
 
-from ...._utils import nvtx_range
 from ...pyexecutor.cuda_graph_lora_params import CudaGraphLoraParams
 
 # TODO: remove
@@ -106,20 +105,19 @@ class LoraLayer(torch.nn.Module):
                  output_hidden_sizes: List[int]):
         super().__init__()
 
-        with nvtx_range("LoraLayer.__init__"):
-            self.lora_module_types = lora_module_types
-            self.output_hidden_sizes = torch.tensor(output_hidden_sizes,
-                                                    dtype=self.SIZES_DTYPE)
-            self.output_hidden_sizes_list = output_hidden_sizes
-            assert len(lora_module_types) == len(output_hidden_sizes)
-            self.output_sizes_offset = CudaGraphLoraParams.get_offset_from_counts(
-                self.output_hidden_sizes).to(
-                    dtype=self.PTR_DTYPE)  # [num_layer_modules]
-            if PARAM_PREP:
-                self.output_sizes_offset_device = self.output_sizes_offset.to(
-                    device='cuda')
-                self.output_hidden_size_device = self.output_hidden_sizes.to(
-                    device='cuda')
+        self.lora_module_types = lora_module_types
+        self.output_hidden_sizes = torch.tensor(output_hidden_sizes,
+                                                dtype=self.SIZES_DTYPE)
+        self.output_hidden_sizes_list = output_hidden_sizes
+        assert len(lora_module_types) == len(output_hidden_sizes)
+        self.output_sizes_offset = CudaGraphLoraParams.get_offset_from_counts(
+            self.output_hidden_sizes).to(
+                dtype=self.PTR_DTYPE)  # [num_layer_modules]
+        if PARAM_PREP:
+            self.output_sizes_offset_device = self.output_sizes_offset.to(
+                device='cuda')
+            self.output_hidden_size_device = self.output_hidden_sizes.to(
+                device='cuda')
 
     def forward(
         self,
