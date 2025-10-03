@@ -88,6 +88,9 @@ class CudaGraphLoraParams:
         self.sorted_ids = torch.zeros(max_batch_size,
                                       dtype=torch.int64,
                                       device=device)
+        self.sorted_ids_host = torch.zeros_like(self.sorted_ids,
+                                                device='cpu',
+                                                pin_memory=True)
 
         # persistent values for gen-only batch with cuda graph
         self.persistent_sorted_ids = self.sorted_ids
@@ -100,9 +103,16 @@ class CudaGraphLoraParams:
         self.slot_counts = torch.zeros(max_lora_size,
                                        dtype=torch.int32,
                                        device=device)
+        self.slot_counts_host = torch.zeros_like(self.slot_counts,
+                                                 device='cpu',
+                                                 pin_memory=True)
         self.slot_offsets = torch.zeros(max_lora_size,
                                         dtype=torch.int64,
                                         device=device)
+        self.slot_offsets_host = torch.zeros_like(self.slot_offsets,
+                                                  device='cpu',
+                                                  pin_memory=True)
+
         self.slot_ranks = torch.zeros(max_lora_size,
                                       dtype=torch.int32,
                                       device=device)
@@ -188,8 +198,11 @@ class CudaGraphLoraParams:
         if actual_batch_size <= self.max_batch_size:
             # if can fit in persistent, use it
             self.sorted_ids = self.persistent_sorted_ids
-            self.slot_ids[:actual_batch_size] = slot_ids
-            self.sorted_ids[:actual_batch_size] = sorted_indices
+            # self.slot_ids[:actual_batch_size] = slot_ids
+            sorted_ids_host = self.sorted_ids_host[:actual_batch_size]
+            sorted_ids_host.copy_(sorted_indices)
+            self.sorted_ids[:actual_batch_size].copy_(sorted_ids_host,
+                                                      non_blocking=True)
         else:
             # otherwise not an gen-only batch, use new allocated sorted_ids
             self.sorted_ids = sorted_indices.to(device=self.device)
@@ -263,8 +276,10 @@ class CudaGraphLoraParams:
                                              non_blocking=True)
 
     @staticmethod
-    def get_offset_from_counts(counts: torch.Tensor) -> torch.Tensor:
-        offset = torch.empty_like(counts, dtype=torch.int64)
+    def get_offset_from_counts(counts: torch.Tensor,
+                               out: torch.Tensor = None) -> torch.Tensor:
+        offset = torch.empty_like(counts,
+                                  dtype=torch.int64) if out is None else out
         offset[0] = 0
         offset[1:] = counts[:-1]
         offset[1:].cumsum_(dim=0)
@@ -285,15 +300,14 @@ class CudaGraphLoraParams:
             peft_table: PEFT table containing adapter configurations
         """
 
-        slot_token_offset = self.get_offset_from_counts(slot_counts)
+        self.slot_counts_host.copy_(slot_counts)
+
+        self.get_offset_from_counts(slot_counts, out=self.slot_offsets_host)
 
         # logger.info(f"slot_token_offset: {slot_token_offset}")
 
-        assert slot_token_offset.ndim == 1 and slot_token_offset.shape[
-            0] == self.max_lora_size
-
-        self.slot_counts.copy_(slot_counts)
-        self.slot_offsets.copy_(slot_token_offset)
+        self.slot_counts.copy_(self.slot_counts_host, non_blocking=True)
+        self.slot_offsets.copy_(self.slot_offsets_host, non_blocking=True)
 
     def get_problem_count(self, layer_key: LoraLayerKey) -> int:
         """

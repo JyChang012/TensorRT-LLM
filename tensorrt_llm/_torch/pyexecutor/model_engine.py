@@ -2162,8 +2162,9 @@ class PyTorchModelEngine(ModelEngine):
             return self.cuda_graph_lora_manager.prepare_cuda_graph_lora_params(
                 scheduled_requests, attn_metadata, peft_cache_manager)
         else:
-            self.cuda_graph_lora_manager.adapter_slot_manager.remove_evicted_slots_in_cpp(
-                peft_cache_manager)
+            if self.cuda_graph_lora_manager is not None:
+                self.cuda_graph_lora_manager.adapter_slot_manager.remove_evicted_slots_in_cpp(
+                    peft_cache_manager)
             peft_table = peft_cache_manager.get_and_reset_batch_peft_table()
             return self._get_legacy_lora_params_from_requests(
                 scheduled_requests, attn_metadata, peft_table)
