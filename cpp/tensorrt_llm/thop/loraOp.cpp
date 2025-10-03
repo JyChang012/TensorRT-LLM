@@ -173,24 +173,19 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
     return output_torch;
 }
 
-th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& reordered_input,
-    th::Tensor const& lora_in_sizes,       // [layer_module_num, max_lora_size, 3]
-    th::Tensor const& lora_out_sizes,      // [layer_module_num, max_lora_size, 3]
-    th::Tensor const& a_offsets,           // [layer_module_num, max_lora_size]
-    th::Tensor const& b_ptrs,              // [layer_module_num, max_lora_size]
-    th::Tensor const& d_offsets,           // [layer_module_num, max_lora_size]
-    th::Tensor const& b_prime_ptrs,        // [layer_module_num, max_lora_size]
-    th::Tensor const& d_prime_offsets,     // [layer_module_num, max_lora_size]
-    th::Tensor const& slot_ids,            // [batch_size] - for reference
-    th::Tensor const& sorted_ids,          // [batch_size] - sorted indices for gather/scatter
+void lora_grouped_gemm_cuda_graph(th::Tensor const& lora_in_sizes, // [layer_module_num, max_lora_size, 3]
+    th::Tensor const& lora_out_sizes,                              // [layer_module_num, max_lora_size, 3]
+    th::Tensor const& a_offsets,                                   // [layer_module_num, max_lora_size]
+    th::Tensor const& b_ptrs,                                      // [layer_module_num, max_lora_size]
+    th::Tensor const& d_offsets,                                   // [layer_module_num, max_lora_size]
+    th::Tensor const& b_prime_ptrs,                                // [layer_module_num, max_lora_size]
+    th::Tensor const& d_prime_offsets,                             // [layer_module_num, max_lora_size]
     int64_t problem_count,
-    th::Tensor const& intermediate_buffer, // Intermediate buffer for d
-    th::Tensor const& output_buffer,       // Output buffer for d'
-    th::Tensor const& lda,                 // Leading dimensions for A matrices [layer_module_num, max_lora_size]
-    th::Tensor const& ldb,                 // Leading dimensions for B matrices [layer_module_num, max_lora_size]
+    th::Tensor const& lda, // Leading dimensions for A matrices [layer_module_num, max_lora_size]
+    th::Tensor const& ldb, // Leading dimensions for B matrices [layer_module_num, max_lora_size]
     th::Tensor const& ldd, // Leading dimensions for C matrices [layer_module_num, max_lora_size] (unused)
     th::Tensor const& ldb_prime, th::Tensor const& ldd_prime, th::Tensor const& host_max_in_sizes,
-    th::Tensor const& host_max_out_sizes, th::Tensor const& splitk_offsets)
+    th::Tensor const& host_max_out_sizes, th::Tensor const& splitk_offsets, c10::ScalarType dtype, int64_t minKN)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -244,17 +239,19 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& reordered_input,
 
     // Get data type
     nvinfer1::DataType loraRuntimeDataType;
-    switch (reordered_input.scalar_type())
+    switch (dtype)
     {
     case torch::kFloat16: loraRuntimeDataType = nvinfer1::DataType::kHALF; break;
     case torch::kBFloat16: loraRuntimeDataType = nvinfer1::DataType::kBF16; break;
-    default: throw std::invalid_argument("Invalid dtype, only supports float16, bfloat16");
+    default: TORCH_CHECK(false, "Invalid dtype, only supports float16, bfloat16, got %s", c10::toString(dtype));
     }
 
     // Calculate workspace size - only need execution workspace, no parameter workspace
-    size_t execution_workspace_size = 8 * 1024 * 1024; // TODO: 16MB for GEMM execution
-    auto execution_workspace = torch::empty(
-        {static_cast<int64_t>(execution_workspace_size)}, reordered_input.options().dtype(torch::kUInt8));
+    size_t execution_workspace_size = 8 * 1024 * 1024; // TODO: hardcode for now, 8MB for GEMM execution
+    auto execution_workspace
+        = torch::empty({static_cast<int64_t>(execution_workspace_size)}, a_offsets.options().dtype(torch::kUInt8));
+
+    int const minKnInt = std::max(1, static_cast<int>(minKN));
 
     // Step 6: Call CUDA Graph compatible grouped GEMM for lora_in (split-K)
     // No parameter workspace needed - tensors are already on GPU
@@ -269,7 +266,7 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& reordered_input,
             true,                                           // isLoraIn
             loraRuntimeDataType,
             16,                                             // splitKSlices
-            1,                                              // minKN
+            minKnInt,                                       // minKN
             host_max_in_sizes_ptr, splitk_offsets_gpu, stream);
         /*
         tk::cuda_graph_grouped_gemm(problem_sizes_1_ptr, problem_count, a_ptrs_gpu, b_ptrs_gpu,
@@ -296,13 +293,12 @@ th::Tensor lora_grouped_gemm_cuda_graph(th::Tensor const& reordered_input,
             execution_workspace_size,
             false,                                                                  // isLoraIn
             loraRuntimeDataType,
-            1,                                                                      // minKN
+            minKnInt,                                                               // minKN
             stream);
         sync_check_cuda_error(stream);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return output_buffer;
 }
 
 } // namespace torch_ext
@@ -323,7 +319,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "bool isRemoveInputPadding) -> Tensor[]");
 
     m.def(
-        "lora_grouped_gemm_cuda_graph(Tensor reordered_input, "
+        "lora_grouped_gemm_cuda_graph("
         "Tensor lora_in_sizes, "
         "Tensor lora_out_sizes, "
         "Tensor a_offsets, "
@@ -331,11 +327,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor d_offsets, "
         "Tensor b_prime_ptrs, "
         "Tensor d_prime_offsets, "
-        "Tensor slot_ids, "
-        "Tensor sorted_ids, "
         "int problem_count, "
-        "Tensor intermediate_buffer, "
-        "Tensor output_buffer, "
         "Tensor lda, "
         "Tensor ldb, "
         "Tensor ldd, "
@@ -343,7 +335,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor ldd_prime, "
         "Tensor host_max_in_sizes, "
         "Tensor host_max_out_sizes, "
-        "Tensor splitk_offsets) -> Tensor");
+        "Tensor splitk_offsets, "
+        "ScalarType dtype, "
+        "int minKN) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
