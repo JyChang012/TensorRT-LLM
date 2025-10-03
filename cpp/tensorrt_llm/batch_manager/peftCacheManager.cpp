@@ -484,6 +484,11 @@ bool PeftCacheManager::isTaskDoneDevice(uint64_t taskId) const
     return mDeviceLoraCache->isDone(taskId);
 }
 
+bool PeftCacheManager::isTaskCachedDevice(uint64_t const taskId) const
+{
+    return mDeviceLoraCache->has(taskId);
+}
+
 void PeftCacheManager::updateTaskState(uint64_t taskId, uint64_t reqId, bool terminate, bool pause)
 {
     if (!terminate)
