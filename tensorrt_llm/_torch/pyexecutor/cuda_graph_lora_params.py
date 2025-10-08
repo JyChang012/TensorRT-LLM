@@ -106,12 +106,13 @@ class CudaGraphLoraParams:
         self.slot_counts_host = torch.zeros_like(self.slot_counts,
                                                  device='cpu',
                                                  pin_memory=True)
-        self.slot_offsets = torch.zeros(max_lora_size,
-                                        dtype=torch.int64,
-                                        device=device)
-        self.slot_offsets_host = torch.zeros_like(self.slot_offsets,
-                                                  device='cpu',
-                                                  pin_memory=True)
+        self.slot_offsets_full = torch.zeros(max_lora_size + 1,
+                                             dtype=torch.int64,
+                                             device=device)
+        self.slot_offsets = self.slot_offsets_full[:-1]
+        self.slot_offsets_full_host = torch.zeros_like(self.slot_offsets_full,
+                                                       device='cpu',
+                                                       pin_memory=True)
 
         self.slot_ranks = torch.zeros(max_lora_size,
                                       dtype=torch.int32,
@@ -170,20 +171,12 @@ class CudaGraphLoraParams:
                                        dtype=torch.int64,
                                        pin_memory=True))
 
-    def update_slot_ids(self, slot_ids: List[int], actual_batch_size: int):
+    @staticmethod
+    def get_sorted_indices(slot_ids: List[int]) -> torch.Tensor:
         """
-        Update slot IDs for the current batch and compute sorted indices.
-
-        Args:
-            slot_ids: List of slot IDs for each token in the batch
-            actual_batch_size: Actual batch size (may be less than max_batch_size)
+        Get sorted indices for the given slot IDs.
         """
-        assert actual_batch_size <= self.max_batch_size, \
-            f"Actual batch size {actual_batch_size} exceeds max {self.max_batch_size}"
-
-        slot_ids = slot_ids[:actual_batch_size]
-        slot_ids = torch.tensor(slot_ids,
-                                dtype=self.persistent_sorted_ids.dtype)
+        slot_ids = torch.tensor(slot_ids, dtype=torch.int64)
 
         # Compute sorted indices for gather/scatter operations
         # Use stable sort to maintain deterministic ordering for tokens with same slot_id
@@ -191,6 +184,20 @@ class CudaGraphLoraParams:
 
         # logger.info(f"sorted_slot_ids: {sorted_slot_ids}")
         # logger.info(f"sorted_indices: {sorted_indices}")
+        return sorted_indices
+
+    def update_sorted_indices(self, slot_ids: List[int]):
+        """
+        Update slot IDs for the current batch and compute sorted indices.
+
+        Args:
+            slot_ids: List of slot IDs for each token in the batch
+            actual_batch_size: Actual batch size (may be less than max_batch_size)
+        """
+        actual_batch_size = len(slot_ids)
+        assert actual_batch_size <= self.max_batch_size, \
+            f"Actual batch size {actual_batch_size} exceeds max {self.max_batch_size}"
+        sorted_indices = self.get_sorted_indices(slot_ids)
 
         # Update sorted_ids tensor with the computed indices
         assert actual_batch_size <= self.max_batch_size, f"CudaGraphLoraParams: Actual batch size {actual_batch_size} exceeds max {self.max_batch_size}!"
@@ -277,37 +284,61 @@ class CudaGraphLoraParams:
 
     @staticmethod
     def get_offset_from_counts(counts: torch.Tensor,
+                               full: bool = False,
                                out: torch.Tensor = None) -> torch.Tensor:
-        offset = torch.empty_like(counts,
-                                  dtype=torch.int64) if out is None else out
+        if out is None:
+            if full:
+                offset = torch.empty(counts.shape[0] + 1,
+                                     dtype=torch.int64,
+                                     device=counts.device)
+            else:
+                offset = torch.empty(counts.shape[0],
+                                     dtype=torch.int64,
+                                     device=counts.device)
+        else:
+            assert (full and out.shape[0] == counts.shape[0] + 1) or (
+                (not full) and out.shape[0] == counts.shape[0])
+            offset = out
+
         offset[0] = 0
-        offset[1:] = counts[:-1]
+
+        if full:
+            offset[1:] = counts
+        else:
+            offset[1:] = counts[:-1]
         offset[1:].cumsum_(dim=0)
         return offset
 
-    def update_gemm_sizes_and_offsets(self, batch_size: int,
-                                      slot_counts: torch.Tensor,
-                                      slot_to_task_mapping: tuple[Optional[int],
-                                                                  ...],
-                                      peft_table: Dict[int, List]):
+    @staticmethod
+    def get_slot_counts(batch_slot_ids: List[int],
+                        max_lora_size: int) -> torch.Tensor:
+        """
+        Get the number of tokens for each slot_id in the batch.
+        """
+        slot_counts = torch.bincount(torch.tensor(batch_slot_ids,
+                                                  dtype=torch.int32),
+                                     minlength=max_lora_size)
+        assert slot_counts.size(0) <= max_lora_size + 1
+        slot_counts = slot_counts[:max_lora_size]
+        # logger.info(f"slot_counts: {slot_counts}")
+        return slot_counts
+
+    def update_slots_params(self, batch_slot_ids: List[int]):
         """
         Update GEMM sizes and buffer offsets based on current batch composition.
 
         Args:
-            batch_size: Current batch size
-            slot_counts: Number of tokens for each slot_id in the batch, shape: [max_lora_size,]
-            slot_to_task_mapping: Mapping from slot_id to task_id, tuple of None for empty slots
-            peft_table: PEFT table containing adapter configurations
+            batch_slot_ids: Slot IDs for each token in the batch
         """
-
+        slot_counts = self.get_slot_counts(batch_slot_ids, self.max_lora_size)
         self.slot_counts_host.copy_(slot_counts)
-
-        self.get_offset_from_counts(slot_counts, out=self.slot_offsets_host)
-
+        self.get_offset_from_counts(slot_counts,
+                                    full=True,
+                                    out=self.slot_offsets_full_host)
         # logger.info(f"slot_token_offset: {slot_token_offset}")
-
         self.slot_counts.copy_(self.slot_counts_host, non_blocking=True)
-        self.slot_offsets.copy_(self.slot_offsets_host, non_blocking=True)
+        self.slot_offsets_full.copy_(self.slot_offsets_full_host,
+                                     non_blocking=True)
 
     def get_problem_count(self, layer_key: LoraLayerKey) -> int:
         """
