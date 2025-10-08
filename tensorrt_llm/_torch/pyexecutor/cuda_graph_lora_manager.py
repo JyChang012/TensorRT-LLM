@@ -148,7 +148,7 @@ class CudaGraphLoraManager:
         ) == 0, f"Context requests are not supported with LoRA CUDA Graph path. Have {len(scheduled_requests.context_requests)} context requests"
         request_list = scheduled_requests.generation_requests
 
-        batch_size = len(request_list)
+        len(request_list)
         peft_table = peft_cache_manager.get_and_reset_batch_peft_table()
 
         # logger.info(f"num gen requests: {len(scheduled_requests.generation_requests)}, request_id: {[req.py_request_id for req in scheduled_requests.generation_requests]}")
@@ -160,14 +160,7 @@ class CudaGraphLoraManager:
 
         # logger.info(f"request_slot_ids: {request_slot_ids}")
         cuda_graph_lora_params = self.cuda_graph_lora_params
-        cuda_graph_lora_params.update_slot_ids(request_slot_ids, batch_size)
-        slot_counts = torch.bincount(torch.tensor(request_slot_ids,
-                                                  dtype=torch.int32),
-                                     minlength=self.max_lora_size)
-        assert slot_counts.size(0) <= self.max_lora_size + 1
-        slot_counts = slot_counts[:self.
-                                  max_lora_size]  # exclude the base model slot
-        # logger.info(f"slot_counts: {slot_counts}")
+        cuda_graph_lora_params.update_sorted_indices(request_slot_ids)
 
         # Get current slot to task mapping
         slot2task = self.adapter_slot_manager.get_slot_to_task_mapping()
@@ -182,11 +175,8 @@ class CudaGraphLoraManager:
 
         # torch.cuda.current_stream().synchronize()   # failed!
         # Update GEMM sizes and offsets based on current batch
-        cuda_graph_lora_params.update_gemm_sizes_and_offsets(
-            batch_size=batch_size,
-            slot_counts=slot_counts,
-            slot_to_task_mapping=slot2task,
-            peft_table=peft_table)
+        cuda_graph_lora_params.update_slots_params(
+            batch_slot_ids=request_slot_ids)
 
         # Create return dictionary compatible with current LoRA layer interface
         # This bridges the old and new interfaces

@@ -1,9 +1,41 @@
+from dataclasses import asdict, dataclass
 from enum import IntEnum
 from typing import Dict, List, Optional
 
 import torch
 
 from ...pyexecutor.cuda_graph_lora_params import CudaGraphLoraParams
+
+
+class DelayedAssert:
+
+    def __init__(self, store_stack: bool = False):
+        self.assertions = []
+        self.store_stack = store_stack
+
+    def add(self, result: bool, msg: str):
+        import traceback
+        self.assertions.append(
+            (bool(result), str(msg), traceback.format_stack()))
+
+    def get_msg(self):
+        ret = ['Some assertions failed:']
+        for result, msg, stack in self.assertions:
+            ret.append('\n'.join([
+                f'Assert result: {result}', msg,
+                ''.join(stack) if self.store_stack else ''
+            ]))
+        ret = '\n-----------------------------------------\n'.join(ret)
+        ret = 'Some assertions failed:\n' + ret
+        return ret
+
+    def clear(self):
+        self.assertions.clear()
+
+    def assert_all(self):
+        assert all(ret[0] for ret in self.assertions), self.get_msg()
+        self.clear()
+
 
 # TODO: remove
 TEST_GEMM = False
@@ -16,6 +48,119 @@ SCATTER = True
 FILL_OUTPUT_0 = False
 RETURN_0_DIRECTLY = False
 RETURN_NONE_DIRECTLY = False
+COMPARE_WITH_PY = False
+
+
+@dataclass
+class GroupedGemmParamsOutput:
+    in_sizes: Optional[torch.Tensor] = None
+    out_sizes: Optional[torch.Tensor] = None
+    a_offset: Optional[torch.Tensor] = None
+    d_offset: Optional[torch.Tensor] = None
+    d_prime_offset: Optional[torch.Tensor] = None
+    lda: Optional[torch.Tensor] = None
+    ldb: Optional[torch.Tensor] = None
+    ldd: Optional[torch.Tensor] = None
+    ldb_prime: Optional[torch.Tensor] = None
+    ldd_prime: Optional[torch.Tensor] = None
+    splitk_offsets: Optional[torch.Tensor] = None
+    reordered_input: Optional[torch.Tensor] = None
+
+
+@dataclass
+class GroupedGemmParamsInput:
+    x: torch.Tensor
+    output_buffer: torch.Tensor
+    intermediate_buffer: torch.Tensor
+    max_lora_size: int
+    max_rank: int
+    slot_counts: torch.Tensor
+    slot_ranks: torch.Tensor
+    slot_offsets_full: torch.Tensor
+    b_ptrs: torch.Tensor
+    b_prime_ptrs: torch.Tensor
+    sorted_ids: torch.Tensor
+
+    @property
+    def slot_offsets(self):
+        return self.slot_offsets_full[:-1]
+
+
+def compare_grouped_gemm_params(
+    params: GroupedGemmParamsOutput,
+    ref: GroupedGemmParamsOutput,
+    params_input: GroupedGemmParamsInput,
+    params_to_store_msg: List[str] | None = ['splitk_offsets'],
+    params_exclude_msg: List[str] | None = None,
+):
+    assert not (params_to_store_msg and params_exclude_msg)
+
+    bs, input_hidden_size = params.reordered_input.shape
+    asserter = DelayedAssert()
+    params_dict = asdict(params)
+    ref_dict = asdict(ref)
+
+    if not params_to_store_msg:
+        params_to_store_msg = set(params_dict.keys())
+    if params_exclude_msg:
+        for name in params_exclude_msg:
+            params_to_store_msg.discard(name)
+
+    def get_msg(name: str, v: torch.Tensor, ref_v: torch.Tensor):
+        is_get_msg = any(p in name or name in p for p in params_to_store_msg)
+        header = f"\n\n{name=}\n"
+        return f"{header} {v=}\n {ref_v=}\n diff:\n{v - ref_v}" if is_get_msg else header
+
+    for name in params_dict.keys():
+        v = params_dict[name]
+        ref_v = ref_dict[name]
+        if name not in ("reordered_input", "a_offset"):
+            asserter.add(
+                v.allclose(ref_v),
+                get_msg(name, v, ref_v),
+            )
+
+    # Test a_offset separately
+    offset = params.a_offset - params.reordered_input.data_ptr()
+    ref_offset = ref.a_offset - ref.reordered_input.data_ptr()
+    asserter.add(
+        (offset == ref_offset).all(),
+        # 'a_offset_fused',
+        get_msg("a_offset", offset, ref_offset))
+
+    # Test reordered_input separately
+    valid_row = params_input.slot_offsets_full[-1].cpu().item()
+    valid_rows = params.reordered_input[:valid_row]
+    ref_valid_rows = ref.reordered_input[:valid_row]
+    asserter.add(
+        valid_rows.allclose(ref_valid_rows),
+        get_msg(f"valid part({valid_row=}, {bs=}) of reordered_input",
+                valid_rows, ref_valid_rows))
+
+    # check intermediate buffer and output buffer are all zeros
+    asserter.add(
+        torch.all(params_input.intermediate_buffer == 0),
+        get_msg("intermediate buffer", params_input.intermediate_buffer, 0))
+    asserter.add(torch.all(params_input.output_buffer == 0),
+                 get_msg("output buffer", params_input.output_buffer, 0))
+
+    if valid_row < bs:
+        invalid_rows = params.reordered_input[valid_row:]
+        ref_invalid_rows = ref.reordered_input[valid_row:]
+        asserter.add(
+            torch.all(invalid_rows == 0),
+            get_msg("invalid part of reordered_input", invalid_rows,
+                    ref_invalid_rows))
+    else:
+        asserter.add(
+            True,
+            f"valid_row is full {valid_row=} v. bs: {params_dict['reordered_input'].shape[0]=}"
+        )
+    asserter.assert_all()
+    '''
+    print(asserter.get_msg())
+    asserter.clear()
+    '''
 
 
 class LoraModuleType(IntEnum):
@@ -137,16 +282,27 @@ class LoraLayer(torch.nn.Module):
         else:
             return None
 
-    def prepare_grouped_gemm_buffers(
-            self, x: torch.Tensor, cuda_graph_lora_params: CudaGraphLoraParams,
-            layer_key: int):
-        device = x.device
-        bs, input_hidden_size = x.shape
-        shape_2d = (len(self.lora_module_types),
-                    cuda_graph_lora_params.max_lora_size
+    def prepare_grouped_gemm_buffers(self, input: GroupedGemmParamsInput):
+        device = input.x.device
+        bs, input_hidden_size = input.x.shape
+        shape_2d = (len(self.lora_module_types), input.max_lora_size
                     )  # [num_layer_modules, max_lora_size]
         shape_3d = shape_2d + (3, )
         sum_out_sizes = sum(self.output_hidden_sizes)
+
+        input.output_buffer.fill_(0)
+        input.intermediate_buffer.fill_(0)
+
+        # reorder input
+        if GATHER:
+            # reordered_input = x[cuda_graph_params.sorted_ids[:batch_size]].contiguous()
+            reordered_input = torch.index_select(input.x, 0,
+                                                 input.sorted_ids[:bs])
+            # reordered_input = torch.index_select(x, 0, sorted_indices)
+            # reordered_input = torch.gather(
+            #     x, 0, cuda_graph_params.sorted_ids[:batch_size].unsqueeze(1).expand_as(x).contiguous())
+        else:
+            reordered_input = input.x
 
         # a [bs, hidden]
         lda = torch.full(shape_2d,
@@ -159,12 +315,12 @@ class LoraLayer(torch.nn.Module):
 
         # a_prime / d [num_layer_modules, bs, max_rank]
         ldd = torch.full(shape_2d,
-                         cuda_graph_lora_params.max_rank,
+                         input.max_rank,
                          dtype=self.LD_DTYPE,
                          device=device)
 
         # b_prime [lora_rank, module_output_size]
-        ldb_prime = cuda_graph_lora_params.slot_ranks.unsqueeze(0).to(
+        ldb_prime = input.slot_ranks.unsqueeze(0).to(
             dtype=self.LD_DTYPE).repeat(shape_2d[0], 1)
 
         # d_prime [bs, sum_of_each_module_output_sizes]
@@ -174,18 +330,16 @@ class LoraLayer(torch.nn.Module):
                                device=device)
 
         # reordered a [bs, hidden], each module has the same offset
-        a_offset = cuda_graph_lora_params.slot_offsets * input_hidden_size
+        a_offset = input.slot_offsets * input_hidden_size
         a_offset = a_offset.unsqueeze(0).repeat(shape_2d[0], 1)
 
         # d [num_layer_modules, bs, max_rank]
-        d_offset = (
-            cuda_graph_lora_params.slot_offsets.unsqueeze(0) + torch.arange(
-                shape_2d[0], device=device, dtype=self.PTR_DTYPE).unsqueeze(1) *
-            bs) * cuda_graph_lora_params.max_rank
+        d_offset = (input.slot_offsets.unsqueeze(0) + torch.arange(
+            shape_2d[0], device=device, dtype=self.PTR_DTYPE).unsqueeze(1) *
+                    bs) * input.max_rank
 
         # d' [bs, sum_of_each_module_output_sizes]
-        bs_offset = cuda_graph_lora_params.slot_offsets.unsqueeze(
-            0)  # [1, max_lora_size]
+        bs_offset = input.slot_offsets.unsqueeze(0)  # [1, max_lora_size]
         bs_offset = bs_offset * sum_out_sizes
         out_offset = self.output_sizes_offset_device.unsqueeze(
             1)  # [num_layer_modules, 1]
@@ -199,10 +353,8 @@ class LoraLayer(torch.nn.Module):
         in_sizes = torch.empty(shape_3d, dtype=self.SIZES_DTYPE, device=device)
         out_sizes = torch.empty_like(in_sizes)
 
-        slot_counts = cuda_graph_lora_params.slot_counts.unsqueeze(
-            0)  # [1, max_lora_size]
-        ranks = cuda_graph_lora_params.slot_ranks.unsqueeze(
-            0)  # [1, max_lora_size]
+        slot_counts = input.slot_counts.unsqueeze(0)  # [1, max_lora_size]
+        ranks = input.slot_ranks.unsqueeze(0)  # [1, max_lora_size]
         output_hidden_sizes = self.output_hidden_size_device.unsqueeze(
             1)  # [num_layer_modules, 1]
 
@@ -214,11 +366,120 @@ class LoraLayer(torch.nn.Module):
         out_sizes[:, :, 1] = output_hidden_sizes
         out_sizes[:, :, 2] = ranks
 
+        # disable unused modules / lora with ptr being zeros
+        in_sizes *= (input.b_ptrs != 0).unsqueeze(-1)
+        out_sizes *= (input.b_prime_ptrs != 0).unsqueeze(-1)
+
+        # splitk_offsets: [num_layer_modules, max_lora_size]
         # splitk offtsets (m * n) for the first grouped gemm with (m, n, k) = (slot_counts, slot_ranks, input_hidden_size)
         splitk_offsets = torch.zeros(shape_2d,
                                      dtype=self.LD_DTYPE,
                                      device=device)  # (layer_problem_count,)
 
+        splitk_offsets.view(-1)[1:] = in_sizes.view(-1, 3)[:-1, 0]  #  = M
+        splitk_offsets.view(-1)[1:] *= in_sizes.view(-1, 3)[:-1, 1]  # *= N
+        splitk_offsets.view(-1).cumsum_(dim=0)
+
+        # add base addresses to offset tensors on GPU
+        dtype_element_size = input.x.element_size()
+        a_offset *= dtype_element_size
+        a_offset += reordered_input.data_ptr()
+
+        d_offset *= dtype_element_size
+        d_offset += input.intermediate_buffer.data_ptr()
+
+        d_prime_offset *= dtype_element_size
+        d_prime_offset += input.output_buffer.data_ptr()
+
+        return GroupedGemmParamsOutput(in_sizes=in_sizes,
+                                       out_sizes=out_sizes,
+                                       a_offset=a_offset,
+                                       d_offset=d_offset,
+                                       d_prime_offset=d_prime_offset,
+                                       lda=lda,
+                                       ldb=ldb,
+                                       ldd=ldd,
+                                       ldb_prime=ldb_prime,
+                                       ldd_prime=ldd_prime,
+                                       splitk_offsets=splitk_offsets,
+                                       reordered_input=reordered_input)
+
+    def _prepare_grouped_gemm_buffers_fused(self,
+                                            input: GroupedGemmParamsInput):
+        device = input.x.device
+        bs, input_hidden_size = input.x.shape
+        shape_2d = (len(self.lora_module_types), input.max_lora_size
+                    )  # [num_layer_modules, max_lora_size]
+        shape_3d = shape_2d + (3, )
+        sum_out_sizes = sum(self.output_hidden_sizes)
+
+        in_sizes = torch.empty(shape_3d, dtype=self.SIZES_DTYPE, device=device)
+        out_sizes = torch.empty_like(in_sizes)
+        a_offset = torch.empty(shape_2d, dtype=self.PTR_DTYPE, device=device)
+        d_offset = torch.empty_like(a_offset)
+        d_prime_offset = torch.empty_like(a_offset)
+        lda = torch.empty(shape_2d, dtype=self.LD_DTYPE, device=device)
+        ldb = lda
+        ldd = torch.empty_like(lda)
+        ldb_prime = torch.empty_like(lda)
+        ldd_prime = torch.empty_like(lda)
+        splitk_offsets = torch.empty(shape_2d,
+                                     dtype=self.LD_DTYPE,
+                                     device=device)  # (layer_problem_count,)
+        reordered_input = torch.empty_like(input.x)
+        torch.ops.trtllm.lora_group_gemm_param_fill_row_reorder_fusion(
+            # output parameters
+            in_sizes,
+            out_sizes,
+            a_offset,
+            d_offset,
+            d_prime_offset,
+            lda,
+            ldd,
+            ldb_prime,
+            ldd_prime,
+            splitk_offsets,
+            reordered_input,
+
+            # input parameters
+            input.max_lora_size,
+            input.max_rank,
+            sum_out_sizes,
+            input_hidden_size,
+            bs,  # batch_size
+            input.slot_counts,
+            input.slot_ranks,
+            input.slot_offsets,
+            self.output_hidden_size_device,
+            self.output_sizes_offset_device,
+            input.b_ptrs,
+            input.b_prime_ptrs,
+            input.x,
+            input.sorted_ids[:bs],
+            input.intermediate_buffer,
+            input.output_buffer,
+            input.x.dtype)
+
+        return GroupedGemmParamsOutput(in_sizes=in_sizes,
+                                       out_sizes=out_sizes,
+                                       a_offset=a_offset,
+                                       d_offset=d_offset,
+                                       d_prime_offset=d_prime_offset,
+                                       lda=lda,
+                                       ldb=ldb,
+                                       ldd=ldd,
+                                       ldb_prime=ldb_prime,
+                                       ldd_prime=ldd_prime,
+                                       splitk_offsets=splitk_offsets,
+                                       reordered_input=reordered_input)
+
+    def _prepare_max_sizes_cpu(self,
+                               cuda_graph_lora_params: CudaGraphLoraParams,
+                               bs: int, input_hidden_size: int):
+        shape_2d = (len(self.lora_module_types),
+                    cuda_graph_lora_params.max_lora_size
+                    )  # [num_layer_modules, max_lora_size]
+        shape_3d = shape_2d + (3, )
         # dummy max sizes, on CPU
         host_max_in_sizes = torch.empty(
             shape_3d, dtype=self.SIZES_DTYPE
@@ -234,7 +495,7 @@ class LoraLayer(torch.nn.Module):
         host_max_out_sizes[:, :, 1] = self.output_hidden_sizes.unsqueeze(1)
         host_max_out_sizes[:, :, 2] = cuda_graph_lora_params.max_rank
 
-        return in_sizes, out_sizes, a_offset, d_offset, d_prime_offset, lda, ldb, ldd, ldb_prime, ldd_prime, host_max_in_sizes, host_max_out_sizes, splitk_offsets
+        return host_max_in_sizes, host_max_out_sizes
 
     def _forward_cuda_graph_mode(
         self,
@@ -271,59 +532,50 @@ class LoraLayer(torch.nn.Module):
         if layer_params is None:
             return 0  # Pass-through for layers without LoRA modules
 
-        # Use the new CUDA Graph compatible grouped GEMM operation
-        # This will be implemented as a new custom operator
-        # Create intermediate buffers sized for LoRA operations only (no base model)
         batch_size, hidden_size = x.shape[0], x.shape[-1]
-
-        # Get max_rank from layer configuration and number of modules
         num_layer_modules = len(self.lora_module_types)
         max_rank = cuda_graph_params.max_rank
-
-        # Output buffer: includes space for ALL tokens (LoRA + base model)
-        # Base model tokens will be handled by pass-through in reordering kernels
         total_output_size = sum(self.output_hidden_sizes)
-        output_buffer = torch.zeros(batch_size,
-                                    total_output_size,
-                                    dtype=x.dtype,
-                                    device=x.device)
         min_kn = min(
             hidden_size, 8, max_rank
         )  # TODO: hardcode to 8 for now, for alignments in kernels, might have alignment error if rank is less than 8!
+
+        output_buffer = torch.empty(batch_size,
+                                    total_output_size,
+                                    dtype=x.dtype,
+                                    device=x.device)
+
+        host_max_in_sizes, host_max_out_sizes = self._prepare_max_sizes_cpu(
+            cuda_graph_params, batch_size, hidden_size)
+
         if RETURN_0_DIRECTLY:
             return output_buffer
 
         # Intermediate buffer: [num_layer_modules, batch_size, max_rank]
-        intermediate_buffer = torch.zeros(
+        intermediate_buffer = torch.empty(
             [num_layer_modules, batch_size, max_rank],
             dtype=x.dtype,
             device=x.device)
 
-        if GATHER:
-            # reordered_input = x[cuda_graph_params.sorted_ids[:batch_size]].contiguous()
-            reordered_input = torch.index_select(
-                x, 0, cuda_graph_params.sorted_ids[:batch_size])
-            # reordered_input = torch.index_select(x, 0, sorted_indices)
-            # reordered_input = torch.gather(
-            #     x, 0, cuda_graph_params.sorted_ids[:batch_size].unsqueeze(1).expand_as(x).contiguous())
-        else:
-            reordered_input = x
-
         if PARAM_PREP:
-            in_sizes, out_sizes, a_offset, d_offset, d_prime_offset, lda, ldb, ldd, ldb_prime, ldd_prime, host_max_in_sizes, host_max_out_sizes, splitk_offsets = self.prepare_grouped_gemm_buffers(
-                x, cuda_graph_params, layer_key)
+            params_fill_input = GroupedGemmParamsInput(
+                x=x,
+                output_buffer=output_buffer,
+                intermediate_buffer=intermediate_buffer,
+                max_lora_size=cuda_graph_params.max_lora_size,
+                max_rank=cuda_graph_params.max_rank,
+                slot_counts=cuda_graph_params.slot_counts,
+                slot_ranks=cuda_graph_params.slot_ranks,
+                slot_offsets_full=cuda_graph_params.slot_offsets_full,
+                b_ptrs=layer_params.d_b_ptrs,
+                b_prime_ptrs=layer_params.d_b_prime_ptrs,
+                sorted_ids=cuda_graph_params.sorted_ids)
+            grouped_gemm_params = self._prepare_grouped_gemm_buffers_fused(
+                params_fill_input)
+
             dtype_element_size = x.element_size()
 
             # sorted_slot_ids, sorted_indices = torch.sort(cuda_graph_params.slot_ids[:batch_size], stable=True)
-
-            # disable unused modules / lora with ptr being zeros
-            in_sizes *= (layer_params.d_b_ptrs != 0).unsqueeze(-1)
-            out_sizes *= (layer_params.d_b_prime_ptrs != 0).unsqueeze(-1)
-
-            # splitk_offsets: [num_layer_modules, max_lora_size]
-            splitk_offsets.view(-1)[1:] = in_sizes.view(-1, 3)[:-1, 0]  #  = M
-            splitk_offsets.view(-1)[1:] *= in_sizes.view(-1, 3)[:-1, 1]  # *= N
-            splitk_offsets.view(-1).cumsum_(dim=0)
             '''
             temp_b_prime = torch.zeros(max(self.output_hidden_sizes_list), cuda_graph_params.max_rank * 5, dtype=x.dtype, device=x.device)
             # layer_params.d_b_prime_ptrs[1] = temp_b_prime.data_ptr()
@@ -365,33 +617,47 @@ class LoraLayer(torch.nn.Module):
 
             print(f'calculated buffers')
 
-            print(f'in_sizes (size: {in_sizes.shape}): {in_sizes.cpu()}')
-            print(f'out_sizes (size: {out_sizes.shape}): {out_sizes.cpu()}')
+            print(
+                f'in_sizes (size: {grouped_gemm_params.in_sizes.shape}): {grouped_gemm_params.in_sizes.cpu()}'
+            )
+            print(
+                f'out_sizes (size: {grouped_gemm_params.out_sizes.shape}): {grouped_gemm_params.out_sizes.cpu()}'
+            )
 
-            print(f'a_offset (size: {a_offset.shape}): {a_offset.cpu()}')
-            print(f'lda (size: {lda.shape}): {lda.cpu()}')
+            print(
+                f'a_offset (size: {grouped_gemm_params.a_offset.shape}): {grouped_gemm_params.a_offset.cpu()}'
+            )
+            print(
+                f'lda (size: {grouped_gemm_params.lda.shape}): {grouped_gemm_params.lda.cpu()}'
+            )
 
             print(
                 f'layer_params.d_b_ptrs (size: {layer_params.d_b_ptrs.shape}): {layer_params.d_b_ptrs.cpu()}'
             )
             print(f'ldb (size: {ldb.shape}): {ldb.cpu()}')
 
-            print(f'd_offset (size: {d_offset.shape}): {d_offset.cpu()}')
+            print(
+                f'd_offset (size: {grouped_gemm_params.d_offset.shape}): {grouped_gemm_params.d_offset.cpu()}'
+            )
             print(f'ldd (size: {ldd.shape}): {ldd.cpu()}')
 
             print(
-                f'd_prime_offset (size: {d_prime_offset.shape}): {d_prime_offset.cpu()}'
+                f'd_prime_offset (size: {grouped_gemm_params.d_prime_offset.shape}): {grouped_gemm_params.d_prime_offset.cpu()}'
             )
-            print(f'ldd_prime (size: {ldd_prime.shape}): {ldd_prime.cpu()}')
+            print(
+                f'ldd_prime (size: {grouped_gemm_params.ldd_prime.shape}): {grouped_gemm_params.ldd_prime.cpu()}'
+            )
 
             print(
                 f'layer_params.d_b_prime_ptrs (size: {layer_params.d_b_prime_ptrs.shape}): {layer_params.d_b_prime_ptrs.cpu()}'
             )
-            print(f'ldb_prime (size: {ldb_prime.shape}): {ldb_prime.cpu()}')
+            print(
+                f'ldb_prime (size: {grouped_gemm_params.ldb_prime.shape}): {grouped_gemm_params.ldb_prime.cpu()}'
+            )
 
             print(f'dtype_element_size: {dtype_element_size}')
             print(
-                f'splitk_offsets (size: {splitk_offsets.shape}): {splitk_offsets.cpu()}'
+                f'splitk_offsets (size: {grouped_gemm_params.splitk_offsets.shape}): {grouped_gemm_params.splitk_offsets.cpu()}'
             )
 
             print('b ptrs:')
@@ -409,7 +675,7 @@ class LoraLayer(torch.nn.Module):
                 f'd_b_prime_ptrs.data_ptr() % (8 * {dtype_element_size}): {layer_params.d_b_prime_ptrs.data_ptr() % (8 * dtype_element_size)}'
             )
             print(
-                f'reordered_input.data_ptr() % (8 * {dtype_element_size}): {reordered_input.data_ptr() % (8 * dtype_element_size)}'
+                f'reordered_input.data_ptr() % (8 * {dtype_element_size}): {grouped_gemm_params.reordered_input.data_ptr() % (8 * dtype_element_size)}'
             )
             print(
                 f'intermediate_buffer.data_ptr() % (8 * {dtype_element_size}): {intermediate_buffer.data_ptr() % (8 * dtype_element_size)}'
@@ -423,26 +689,6 @@ class LoraLayer(torch.nn.Module):
         d_offset.fill_(0)
         '''
 
-        if PARAM_PREP:
-            # Convert offsets to actual pointers using CUDA Graph compatible operations
-            # Use PyTorch tensor operations to add base addresses to offset tensors on GPU
-            a_offset *= dtype_element_size
-            a_offset += reordered_input.data_ptr()
-
-            d_offset *= dtype_element_size
-            d_offset += intermediate_buffer.data_ptr()
-
-            d_prime_offset *= dtype_element_size
-            d_prime_offset += output_buffer.data_ptr()
-            '''
-            out_buffers = [torch.zeros([batch_size, osz], dtype=x.dtype, device=x.device) for osz in self.output_hidden_sizes]
-            d_prime_offset *= dtype_element_size
-            base_out_ptr = torch.zeros(self.output_hidden_size_device.shape[0], dtype=self.PTR_DTYPE, device=x.device)
-            for i in range(self.output_hidden_size_device.shape[0]):
-                base_out_ptr[i] = out_buffers[i].data_ptr()
-            d_prime_offset += base_out_ptr.unsqueeze(1)
-            '''
-
         if PRINT_AND_ASSERT:
             assert output_buffer.is_contiguous()
             out_splitted = [
@@ -453,32 +699,35 @@ class LoraLayer(torch.nn.Module):
             pyt_strides = torch.tensor([out.stride(0) for out in out_splitted],
                                        dtype=self.LD_DTYPE,
                                        device=x.device)  # nModules,
-            assert torch.all(ldd_prime == pyt_strides.unsqueeze(1))
+            assert torch.all(
+                grouped_gemm_params.ldd_prime == pyt_strides.unsqueeze(1))
             pyt_addr = torch.tensor([out.data_ptr() for out in out_splitted],
                                     dtype=self.PTR_DTYPE,
                                     device=x.device)
-            assert torch.all(pyt_addr == d_prime_offset[:, 0])
+            assert torch.all(pyt_addr == grouped_gemm_params.d_prime_offset[:,
+                                                                            0])
             print(f'pyt_strides: {pyt_strides.cpu()}')
-            print(f'ldd_prime: {ldd_prime.cpu()}')
+            print(f'ldd_prime: {grouped_gemm_params.ldd_prime.cpu()}')
             print(f'pyt_addr: {pyt_addr.cpu()}')
-            print(f'd_prime_ptr: {d_prime_offset.cpu()}')
+            print(f'd_prime_ptr: {grouped_gemm_params.d_prime_offset.cpu()}')
 
             def assert_aligned(ptr, alignment):
                 assert torch.all((ptr % alignment) == 0)
 
-            assert_aligned(a_offset, 8 * dtype_element_size)
-            assert_aligned(d_offset, 8 * dtype_element_size)
-            assert_aligned(d_prime_offset, 8 * dtype_element_size)
+            assert_aligned(grouped_gemm_params.a_offset, 8 * dtype_element_size)
+            assert_aligned(grouped_gemm_params.d_offset, 8 * dtype_element_size)
+            assert_aligned(grouped_gemm_params.d_prime_offset,
+                           8 * dtype_element_size)
             assert_aligned(layer_params.d_b_ptrs, 8 * dtype_element_size)
             assert_aligned(layer_params.d_b_prime_ptrs, 8 * dtype_element_size)
 
-            assert_aligned(in_sizes[:, :, 1:], 8)
-            assert_aligned(out_sizes[:, :, 1:], 8)
-            assert_aligned(lda, 8)
-            assert_aligned(ldb, 8)
-            assert_aligned(ldd, 8)
-            assert_aligned(ldb_prime, 8)
-            assert_aligned(ldd_prime, 8)
+            assert_aligned(grouped_gemm_params.in_sizes[:, :, 1:], 8)
+            assert_aligned(grouped_gemm_params.out_sizes[:, :, 1:], 8)
+            assert_aligned(grouped_gemm_params.lda, 8)
+            assert_aligned(grouped_gemm_params.ldb, 8)
+            assert_aligned(grouped_gemm_params.ldd, 8)
+            assert_aligned(grouped_gemm_params.ldb_prime, 8)
+            assert_aligned(grouped_gemm_params.ldd_prime, 8)
             '''
             # fake buffers
             bs = [torch.zeros([r, hidden_size], device=x.device, dtype=x.dtype) for _ in self.output_hidden_sizes for r in cuda_graph_params.slot_ranks]
@@ -731,14 +980,26 @@ class LoraLayer(torch.nn.Module):
             return 0
         else:
             if GROUPED_GEMM and PARAM_PREP:
+                if COMPARE_WITH_PY:
+                    grouped_gemm_params_py = self.prepare_grouped_gemm_buffers(
+                        params_fill_input)
+                    compare_grouped_gemm_params(grouped_gemm_params,
+                                                grouped_gemm_params_py,
+                                                params_fill_input)
+                    print(
+                        f"✅ {layer_key=} Fused kernel correctness test passed!")
+
                 torch.ops.trtllm.lora_grouped_gemm_cuda_graph(
-                    in_sizes, out_sizes, a_offset, layer_params.d_b_ptrs,
-                    d_offset, layer_params.d_b_prime_ptrs, d_prime_offset,
-                    cuda_graph_params.get_problem_count(layer_key), lda, ldb,
-                    ldd, ldb_prime, ldd_prime, host_max_in_sizes,
-                    host_max_out_sizes, splitk_offsets, reordered_input.dtype,
-                    min_kn)
-            # assert lora_outputs.data_ptr() == output_buffer.data_ptr()
+                    grouped_gemm_params.in_sizes, grouped_gemm_params.out_sizes,
+                    grouped_gemm_params.a_offset, layer_params.d_b_ptrs,
+                    grouped_gemm_params.d_offset, layer_params.d_b_prime_ptrs,
+                    grouped_gemm_params.d_prime_offset,
+                    cuda_graph_params.get_problem_count(layer_key),
+                    grouped_gemm_params.lda, grouped_gemm_params.ldb,
+                    grouped_gemm_params.ldd, grouped_gemm_params.ldb_prime,
+                    grouped_gemm_params.ldd_prime, host_max_in_sizes,
+                    host_max_out_sizes, grouped_gemm_params.splitk_offsets,
+                    grouped_gemm_params.reordered_input.dtype, min_kn)
             '''
             restored_output = output_buffer
             output_buffer = torch.cat(out_buffers, dim=-1)
@@ -751,6 +1012,7 @@ class LoraLayer(torch.nn.Module):
                 output_buffer)
             '''
             # restored_output = output_buffer[cuda_graph_params.sorted_ids[:batch_size]].contiguous()
+            # TODO: move to kernel
             restored_output = torch.zeros_like(output_buffer)
             '''
             restored_output.scatter_(
