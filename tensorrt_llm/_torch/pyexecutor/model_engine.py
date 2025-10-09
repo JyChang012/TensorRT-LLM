@@ -493,22 +493,22 @@ class PyTorchModelEngine(ModelEngine):
     def _init_cuda_graph_lora_manager(self, lora_config: LoraConfig):
         """Initialize CUDA Graph LoRA manager with model configuration."""
         # Get model configuration
-        self.model.config
-        max_lora_size = lora_config.max_loras or 8  # Default fallback
-        max_batch_size = self.batch_size  # Use engine's max batch size
+        if self.cuda_graph_runner.enabled:
+            max_lora_size = lora_config.max_loras or 8  # Default fallback
+            max_batch_size = self.batch_size  # Use engine's max batch size
 
-        self.cuda_graph_lora_manager = CudaGraphLoraManager(
-            max_lora_size=max_lora_size,
-            max_batch_size=max_batch_size,
-            max_lora_rank=lora_config.max_lora_rank,
-            model=self.model,
-            lora_model_config=self.lora_model_config,
-            device='cuda')
+            self.cuda_graph_lora_manager = CudaGraphLoraManager(
+                max_lora_size=max_lora_size,
+                max_batch_size=max_batch_size,
+                max_lora_rank=lora_config.max_lora_rank,
+                model=self.model,
+                lora_model_config=self.lora_model_config,
+                device='cuda')
 
-        logger.info(
-            f"Initialized CUDA Graph LoRA manager, "
-            f"max {max_lora_size} adapters, max rank {lora_config.max_lora_rank}"
-        )
+            logger.info(
+                f"Initialized CUDA Graph LoRA manager, "
+                f"max {max_lora_size} adapters, max rank {lora_config.max_lora_rank}"
+            )
 
     def set_guided_decoder(self,
                            guided_decoder: CapturableGuidedDecoder) -> bool:
