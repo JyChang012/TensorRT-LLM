@@ -1,24 +1,24 @@
 import json
 import tarfile
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import OrderedDict, Type
-import functools
+
+import pytest
 import torch
 from utils.llm_data import llm_models_root
 from utils.util import duplicate_list_to_length, flatten_list, similar
-import pytest
+
 from tensorrt_llm import SamplingParams
+from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import \
+    CudaGraphLoraParams
 from tensorrt_llm._torch.peft.lora.layer import (GroupedGemmParamsInput,
                                                  LoraLayer,
                                                  compare_grouped_gemm_params)
-from tensorrt_llm._torch.pyexecutor.cuda_graph_lora_params import \
-    CudaGraphLoraParams
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
-from dataclasses import dataclass
-
 
 
 def check_llama_7b_multi_unique_lora_adapters_from_request(
@@ -378,4 +378,5 @@ def compare_cuda_graph_lora_params_filler(test_params: CUDAGraphLoRATestParams):
                                 params_to_store_msg=None)
 
 
-test_lora_with_and_without_cuda_graph = pytest.mark.parametrize("cuda_graph_config", [CudaGraphConfig(max_batch_size=10), None])
+test_lora_with_and_without_cuda_graph = pytest.mark.parametrize(
+    "cuda_graph_config", [CudaGraphConfig(max_batch_size=10), None])

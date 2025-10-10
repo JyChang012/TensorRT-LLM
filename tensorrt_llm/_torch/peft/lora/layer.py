@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from ...pyexecutor.cuda_graph_lora_params import CudaGraphLoraParams
+from .cuda_graph_lora_params import CudaGraphLoraParams
 
 
 class DelayedAssert:

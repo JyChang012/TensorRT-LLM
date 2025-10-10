@@ -8,8 +8,8 @@ by maintaining a fixed number of slots for different LoRA adapters (task_ids).
 from collections import OrderedDict
 from typing import List, Optional
 
-from .resource_manager import PeftCacheManager
-from .scheduler import RequestList
+from ...pyexecutor.resource_manager import PeftCacheManager
+from ...pyexecutor.scheduler import RequestList
 
 
 class AdapterSlotManager:
