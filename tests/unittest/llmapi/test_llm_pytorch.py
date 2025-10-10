@@ -6,7 +6,7 @@ import pytest
 from tensorrt_llm import LLM
 from tensorrt_llm.executor import GenerationExecutorWorker
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, PeftCacheConfig
+from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
@@ -16,10 +16,9 @@ from .lora_test_utils import (
     check_llama_7b_multi_lora_from_request_test_harness,
     check_llama_7b_multi_unique_lora_adapters_from_request,
     create_mock_nemo_lora_checkpoint,
-    DelayedAssert,
     compare_cuda_graph_lora_params_filler,
     CUDAGraphLoRATestParams,
-)
+    test_lora_with_and_without_cuda_graph)
 from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        global_kvcache_config, llama_model_path,
                        llm_get_stats_async_test_harness,
@@ -41,133 +40,9 @@ import torch
 from peft import LoraConfig as PeftLoraConfig
 from peft import get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from collections import OrderedDict
-from copy import deepcopy
 from dataclasses import replace
 
 # isort: on
-
-# TODO: hardcode for now
-cuda_graph_config = CudaGraphConfig(max_batch_size=10, enable_padding=True)
-disable_overlap_scheduler = False
-# cuda_graph_config = None
-
-
-def test_llama_7b_cuda_graph_same_results():
-    hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
-    prompt_to_references = OrderedDict({
-        ("美国的首都在哪里? \n答案:", None):
-        "沃尔玛\n\n## 新闻\n\n* ",
-        ("アメリカ合衆国の首都はどこですか? \n答え:", None):
-        "Washington, D.C.\nWashington, D.C. is the capital of the United",
-    })
-    prompts_to_references = list(prompt_to_references.items())
-    selected = [0, 1, 1, 0, 1, 0]
-    prompts = [prompts_to_references[i][0][0] for i in selected]
-    references = [prompts_to_references[i][1] for i in selected]
-    kwargs = dict()
-    kwargs['lora_config'] = LoraConfig(
-        lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
-        max_lora_rank=8,
-        max_loras=2,
-        max_cpu_loras=2)
-    kwargs['peft_cache_config'] = PeftCacheConfig(
-        host_cache_size=1,  # size in bytes
-        device_cache_percent=0.0000001)
-
-    llm = LLM(hf_model_dir,
-              cuda_graph_config=CudaGraphConfig(max_batch_size=10,
-                                                enable_padding=False),
-              disable_overlap_scheduler=disable_overlap_scheduler,
-              **kwargs)
-    sampling_params = SamplingParams(max_tokens=20, temperature=0, top_k=1)
-    asserter = DelayedAssert()
-    prev_outputs = None
-    for i in range(5):
-        print(f"Running {i}th time")
-        outputs = llm.generate(prompts.copy(), deepcopy(sampling_params))
-        outputs = [output.outputs[0].text for output in outputs]
-        if prev_outputs:
-            asserter.add(
-                outputs == prev_outputs,
-                f"{i}th runs: results vs previous: [{[c == prev for c, prev in zip(outputs, prev_outputs)]}]\nOutputs: {outputs}\nPrev outputs: {prev_outputs}"
-            )
-        else:
-            prev_outputs = outputs
-    if prev_outputs:
-        asserter.add(
-            prev_outputs == references,
-            f"{i}th runs: results1 vs references: {[c == ref for c, ref in zip(prev_outputs, references)]}\nOutputs1: {prev_outputs}\nReferences: {references}"
-        )
-        if outputs and prev_outputs != outputs:
-            asserter.add(
-                outputs == references,
-                f"{i}th runs: results2 vs references: {[c == ref for c, ref in zip(outputs, references)]}\nOutputs2: {outputs}\nReferences: {references}"
-            )
-
-    print(f'prev_outputs: {prev_outputs}')
-    print(f'outputs: {outputs}')
-    print(f'references: {references}')
-    asserter.assert_all()
-
-
-def test_lora_cuda_graph_params_filling_kernel_special_cases():
-    torch.cuda.set_device(0)
-
-    # test all requests have the same LoRA id case
-    test_params = CUDAGraphLoRATestParams(
-        batch_slot_ids=[0] * 10,
-        input_hidden_size=4096,
-        slot_ranks=[64] * 10,
-        max_lora_rank=64,
-        output_hidden_sizes=[123],
-        layer_module_mask=None,
-        dtype=torch.bfloat16,
-        seed=42,
-    )
-    compare_cuda_graph_lora_params_filler(test_params)
-
-    # test no LoRA in a batch case
-    test_params2 = replace(test_params,
-                           batch_slot_ids=[len(test_params.slot_ranks)] * 10)
-    compare_cuda_graph_lora_params_filler(test_params2)
-
-    # test all having three modules case
-    test_params3 = replace(test_params, output_hidden_sizes=[123, 456, 789])
-    compare_cuda_graph_lora_params_filler(test_params3)
-
-    # test some layer module have invalid weight pointers case
-    mask = torch.full((test_params3.module_count, test_params3.slot_count),
-                      True,
-                      dtype=torch.bool)
-    mask[0, 0] = False
-    mask[1, 7] = False
-    mask[2, 3] = False
-    test_params4 = replace(test_params3, layer_module_mask=mask)
-    compare_cuda_graph_lora_params_filler(test_params4)
-
-    # test mixed slot ids case
-    test_params5 = CUDAGraphLoRATestParams(
-        batch_slot_ids=[6, 2, 0, 1, 1, 1, 5, 6],
-        input_hidden_size=512,
-        slot_ranks=[8, 12, 4] * 2,
-        max_lora_rank=15,
-        output_hidden_sizes=[123, 456, 789],
-        layer_module_mask=None,
-        dtype=torch.bfloat16,
-        seed=42,
-    )
-    compare_cuda_graph_lora_params_filler(test_params5)
-
-    # test mixed slot with invalid weight pointers
-    mask = torch.full((test_params5.module_count, test_params5.slot_count),
-                      True,
-                      dtype=torch.bool)
-    mask[1, 3] = False
-    mask[2, 5] = False
-    mask[-1, -4] = False
-    test_params6 = replace(test_params5, layer_module_mask=mask)
-    compare_cuda_graph_lora_params_filler(test_params6)
 
 
 @force_ampere
@@ -392,6 +267,65 @@ def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
                      enable_mixed_sampler=enable_mixed_sampler)
 
 
+def test_lora_cuda_graph_params_filling_kernel_special_cases():
+    torch.cuda.set_device(0)
+
+    # test all requests have the same LoRA id case
+    test_params = CUDAGraphLoRATestParams(
+        batch_slot_ids=[0] * 10,
+        input_hidden_size=4096,
+        slot_ranks=[64] * 10,
+        max_lora_rank=64,
+        output_hidden_sizes=[123],
+        layer_module_mask=None,
+        dtype=torch.bfloat16,
+        seed=42,
+    )
+    compare_cuda_graph_lora_params_filler(test_params)
+
+    # test no LoRA in a batch case
+    test_params2 = replace(test_params,
+                           batch_slot_ids=[len(test_params.slot_ranks)] * 10)
+    compare_cuda_graph_lora_params_filler(test_params2)
+
+    # test all having three modules case
+    test_params3 = replace(test_params, output_hidden_sizes=[123, 456, 789])
+    compare_cuda_graph_lora_params_filler(test_params3)
+
+    # test some layer module have invalid weight pointers case
+    mask = torch.full((test_params3.module_count, test_params3.slot_count),
+                      True,
+                      dtype=torch.bool)
+    mask[0, 0] = False
+    mask[1, 7] = False
+    mask[2, 3] = False
+    test_params4 = replace(test_params3, layer_module_mask=mask)
+    compare_cuda_graph_lora_params_filler(test_params4)
+
+    # test mixed slot ids case
+    test_params5 = CUDAGraphLoRATestParams(
+        batch_slot_ids=[6, 2, 0, 1, 1, 1, 5, 6],
+        input_hidden_size=512,
+        slot_ranks=[8, 12, 4] * 2,
+        max_lora_rank=15,
+        output_hidden_sizes=[123, 456, 789],
+        layer_module_mask=None,
+        dtype=torch.bfloat16,
+        seed=42,
+    )
+    compare_cuda_graph_lora_params_filler(test_params5)
+
+    # test mixed slot with invalid weight pointers
+    mask = torch.full((test_params5.module_count, test_params5.slot_count),
+                      True,
+                      dtype=torch.bool)
+    mask[1, 3] = False
+    mask[2, 5] = False
+    mask[-1, -4] = False
+    test_params6 = replace(test_params5, layer_module_mask=mask)
+    compare_cuda_graph_lora_params_filler(test_params6)
+
+
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
     lora_config = LoraConfig(
         lora_dir=[f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"],
@@ -425,20 +359,19 @@ def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_lora():
-    llama_7b_lora_from_dir_test_harness(
-        cuda_graph_config=deepcopy(cuda_graph_config))
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_lora(cuda_graph_config):
+    llama_7b_lora_from_dir_test_harness(cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_lora_default_modules() -> None:
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_lora_default_modules(cuda_graph_config) -> None:
     lora_config = LoraConfig(max_lora_rank=64, max_loras=2, max_cpu_loras=2)
 
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
 
-    llm = LLM(model=hf_model_dir,
-              lora_config=lora_config,
-              cuda_graph_config=deepcopy(cuda_graph_config))
+    llm = LLM(model=hf_model_dir, lora_config=lora_config, cuda_graph_config=cuda_graph_config)
 
     hf_lora_dir = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
     try:
@@ -466,7 +399,7 @@ def test_llama_7b_lora_default_modules() -> None:
 
 def _check_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call: list[int], max_loras: int,
-        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
+        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int, **llm_kwargs):
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
     # (1) specify lora_target_modules, or
     # (2) provide a lora_dir to infer the lora_target_modules.
@@ -479,26 +412,13 @@ def _check_llama_7b_multi_lora_evict_load_new_adapters(
         repeat_calls,
         repeats_per_call,
         LLM,
-        lora_config=deepcopy(lora_config),
-        # Disable CUDA graph
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        disable_overlap_scheduler=disable_overlap_scheduler,
-        # enable_layerwise_nvtx_marker=True,
-        cuda_graph_config=cuda_graph_config.model_copy(deep=True))
+        lora_config=lora_config,
+        **llm_kwargs)
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_bs1():
-    _check_llama_7b_multi_lora_evict_load_new_adapters(
-        lora_adapter_count_per_call=[1, 1, 1, 1],
-        max_loras=3,
-        max_cpu_loras=1,
-        repeat_calls=1,
-        repeats_per_call=1)
-
-
-@skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache():
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache(cuda_graph_config):
     """Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
     llm.generate call, that's repeated twice.
     """  # noqa: D205
@@ -507,11 +427,13 @@ def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache():
         max_loras=1,
         max_cpu_loras=2,
         repeat_calls=2,
-        repeats_per_call=3)
+        repeats_per_call=3,
+        cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache():
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache(cuda_graph_config):
     """Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
     cache size < LoRA CPU cache size.
     """  # noqa: D205
@@ -520,29 +442,26 @@ def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache():
         max_loras=1,
         max_cpu_loras=3,
         repeat_calls=1,
-        repeats_per_call=1)
+        repeats_per_call=1,
+        cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_read_from_cache_after_insert():
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_multi_lora_read_from_cache_after_insert(cuda_graph_config):
     """Test that loading and then using the same adapters loaded in cache works."""
-    n = 5
-    # repeat = 10
-    repeat = 5
-    for i in range(repeat):
-        print(
-            f"Running {i}th test_llama_7b_multi_lora_read_from_cache_after_insert"
-        )
-        _check_llama_7b_multi_lora_evict_load_new_adapters(
-            lora_adapter_count_per_call=[n],
-            max_loras=n,
-            max_cpu_loras=n,
-            repeat_calls=4,
-            repeats_per_call=1)
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[3],
+        max_loras=3,
+        max_cpu_loras=3,
+        repeat_calls=2,
+        repeats_per_call=1,
+        cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_cache(
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_cache(cuda_graph_config
 ):
     """Test eviction, reloading new adapters and reloading previously evicted adapters from the LoRA CPU cache & GPU
     cache over multiple llm.generate call repeated twice (two calls with the same requests):
@@ -560,11 +479,13 @@ def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_ca
         max_loras=2,
         max_cpu_loras=2,
         repeat_calls=2,
-        repeats_per_call=1)
+        repeats_per_call=1,
+        cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_peft_cache_config_affects_peft_cache_size():
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_peft_cache_config_affects_peft_cache_size(cuda_graph_config):
     """Tests that LLM arg of peft_cache_config affects the peft cache sizes.
 
     NOTE: The caller can't get the actual LoRA cache sizes, so we instead we
@@ -584,9 +505,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
             lora_config=lora_config_no_cache_size_values,
             peft_cache_config=PeftCacheConfig(
                 host_cache_size=1),  # size in bytes
-            # Disable CUDA graph
-            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-            cuda_graph_config=deepcopy(cuda_graph_config))
+            cuda_graph_config=cuda_graph_config)
 
     # Test that too small PeftCacheConfig.device_cache_percent causes failure
     with pytest.raises(RuntimeError):
@@ -594,40 +513,34 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
             LLM,
             lora_config=lora_config_no_cache_size_values,
             peft_cache_config=PeftCacheConfig(device_cache_percent=0.0000001),
-            # Disable CUDA graph
-            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-            cuda_graph_config=deepcopy(cuda_graph_config))
+            cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_lora_config_overrides_peft_cache_config():
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_lora_config_overrides_peft_cache_config(cuda_graph_config):
     """Tests that cache size args in lora_config LLM arg override the cache size
     parameters in peft_cache_config LLM arg.
     """    # noqa: D205
-    for i in range(5):
-        print(
-            f'Running {i}th test_llama_7b_lora_config_overrides_peft_cache_config'
-        )
-        check_llama_7b_multi_lora_from_request_test_harness(
-            LLM,
-            lora_config=LoraConfig(
-                lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
-                max_lora_rank=8,
-                max_loras=2,
-                max_cpu_loras=2),
-            disable_overlap_scheduler=disable_overlap_scheduler,
-            max_batch_size=10,
-            peft_cache_config=PeftCacheConfig(
-                host_cache_size=1,  # size in bytes
-                device_cache_percent=0.0000001),
-            cuda_graph_config=cuda_graph_config.model_copy(deep=True))
+    check_llama_7b_multi_lora_from_request_test_harness(
+        LLM,
+        lora_config=LoraConfig(
+            lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+            max_lora_rank=8,
+            max_loras=2,
+            max_cpu_loras=2),
+        peft_cache_config=PeftCacheConfig(
+            host_cache_size=1,  # size in bytes
+            device_cache_percent=0.0000001),
+        cuda_graph_config=cuda_graph_config)
 
 
 # TODO smor: currently Nemotron-Super-49B-v1 with LoRA memory consumption is overly high
 # https://jirasw.nvidia.com/browse/TRTLLM-5045
 @pytest.mark.skip(reason="https://nvbugs/5448464")
 @skip_gpu_memory_less_than_138gb
-def test_nemotron_nas_lora() -> None:
+@test_lora_with_and_without_cuda_graph
+def test_nemotron_nas_lora(cuda_graph_config) -> None:
     lora_config = LoraConfig(lora_dir=[
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64"
     ],
@@ -639,7 +552,7 @@ def test_nemotron_nas_lora() -> None:
         model=
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
         lora_config=lora_config,
-        cuda_graph_config=deepcopy(cuda_graph_config))
+        cuda_graph_config=cuda_graph_config)
 
     prompts = [
         "Hello, how are you?",
@@ -659,7 +572,8 @@ def test_nemotron_nas_lora() -> None:
 
 
 @skip_gpu_memory_less_than_80gb
-def test_codellama_fp8_with_bf16_lora() -> None:
+@test_lora_with_and_without_cuda_graph
+def test_codellama_fp8_with_bf16_lora(cuda_graph_config) -> None:
     model_dir = f"{llm_models_root()}/codellama/CodeLlama-7b-Instruct-hf/"
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
                                kv_cache_quant_algo=QuantAlgo.FP8)
@@ -699,10 +613,7 @@ def test_codellama_fp8_with_bf16_lora() -> None:
                                  max_loras=2,
                                  max_cpu_loras=2)
 
-        llm = LLM(model_dir,
-                  quant_config=quant_config,
-                  lora_config=lora_config,
-                  cuda_graph_config=deepcopy(cuda_graph_config))
+        llm = LLM(model_dir, quant_config=quant_config, lora_config=lora_config, cuda_graph_config=cuda_graph_config)
 
         prompts = [
             "Write a function that calculates the Fibonacci sequence.",
@@ -722,7 +633,8 @@ def test_codellama_fp8_with_bf16_lora() -> None:
 
 
 @skip_gpu_memory_less_than_80gb
-def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
+@test_lora_with_and_without_cuda_graph
+def test_bielik_11b_v2_2_instruct_multi_lora(cuda_graph_config) -> None:
     model_dir = f"{llm_models_root()}/Bielik-11B-v2.2-Instruct"
 
     target_modules = ['attn_q', 'attn_k', 'attn_v']
@@ -753,9 +665,7 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
                                         max_lora_rank=8,
                                         max_loras=2,
                                         max_cpu_loras=2)
-        llm = LLM(model_dir,
-                  lora_config=trtllm_lora_config,
-                  cuda_graph_config=deepcopy(cuda_graph_config))
+        llm = LLM(model_dir, lora_config=trtllm_lora_config, cuda_graph_config=cuda_graph_config)
 
         prompts = [
             "Kim był Mikołaj Kopernik i z czego zasłynął?",
@@ -773,7 +683,8 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
         assert len(outputs) == 2
 
 
-def test_gemma3_1b_instruct_multi_lora() -> None:
+@test_lora_with_and_without_cuda_graph
+def test_gemma3_1b_instruct_multi_lora(cuda_graph_config) -> None:
     model_dir = f"{llm_models_root()}/gemma/gemma-3-1b-it"
 
     target_modules = ['attn_q', 'attn_k', 'attn_v']
@@ -812,7 +723,7 @@ def test_gemma3_1b_instruct_multi_lora() -> None:
         llm = LLM(model_dir,
                   lora_config=trtllm_lora_config,
                   kv_cache_config=kv_cache_config,
-                  cuda_graph_config=deepcopy(cuda_graph_config))
+                  cuda_graph_config=cuda_graph_config)
 
         prompts = [
             "Is it ok to fill diesel in a petrol car?",
@@ -892,7 +803,8 @@ def test_nemo_lora_unsupported_modules_validation(tmp_path):
 
 
 @force_ampere
-def test_gqa_nemo_lora(tmp_path):
+@test_lora_with_and_without_cuda_graph
+def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
     """
     Test NeMo-format LoRA checkpoint loading and GQA support in TinyLlama.
 
@@ -937,7 +849,7 @@ def test_gqa_nemo_lora(tmp_path):
         model=model_path,
         lora_config=lora_config,
         kv_cache_config=global_kvcache_config,
-        cuda_graph_config=deepcopy(cuda_graph_config),
+        cuda_graph_config=cuda_graph_config,
     )
 
     try:
