@@ -81,7 +81,49 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
     int32_t const* hostContextLengths
         = isRemoveInputPadding ? static_cast<int32_t const*>(host_context_lengths.data_ptr()) : nullptr;
 
-    int64_t numTokens = getNumTokens(input);
+    int64_t const numTokens = getNumTokens(input);
+
+    int64_t numContextRequests = 0;
+    int64_t numGenRequests = 0;
+    int64_t totalContextTokens = 0;
+    for (int reqIdx = 0; reqIdx < numReqs; ++reqIdx)
+    {
+        RequestType const reqType = static_cast<RequestType const>(reqTypes[reqIdx]);
+        if (reqType == RequestType::kGENERATION)
+        {
+            numGenRequests += 1;
+            continue;
+        }
+        numContextRequests += 1;
+        int64_t const contextLen
+            = isRemoveInputPadding ? static_cast<int64_t>(hostContextLengths[reqIdx]) : static_cast<int64_t>(seqLen);
+        totalContextTokens += contextLen;
+    }
+    // TODO: remove unnecessary check
+    TLLM_CHECK_WITH_INFO(numContextRequests + numGenRequests == numReqs,
+        fmtstr("Request type mismatch: numReqs %ld context requests %ld generation requests %ld", numReqs,
+            numContextRequests, numGenRequests));
+
+    int64_t const totalDraftTokens = numTokens - totalContextTokens;
+    TLLM_CHECK_WITH_INFO(totalDraftTokens >= 0,
+        fmtstr("Found more context tokens than total tokens: context tokens %ld total tokens %ld", totalContextTokens,
+            numTokens));
+
+    int64_t draftTokensPerGen = 0;
+    if (numGenRequests > 0)
+    {
+        TLLM_CHECK_WITH_INFO(totalDraftTokens % numGenRequests == 0,
+            fmtstr("Draft tokens per generation request must be an integer: total draft tokens %ld, generation "
+                   "requests %ld",
+                totalDraftTokens, numGenRequests));
+        draftTokensPerGen = totalDraftTokens / numGenRequests;
+    }
+    else
+    {
+        // TODO: remove this check
+        TLLM_CHECK_WITH_INFO(totalDraftTokens == 0,
+            fmtstr("No generation requests but found %ld draft tokens coming from input", totalDraftTokens));
+    }
 
     std::vector<void const*> expandLoraWeightPtrs{};
     std::vector<int32_t> expandLoraRanks{};
@@ -102,16 +144,19 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
             RequestType const reqType = static_cast<RequestType const>(reqTypes[reqId]);
             if (reqType == RequestType::kGENERATION)
             {
-                expandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 3]));
-                expandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 3 + 1]));
-                expandLoraRanks.push_back(loraRankModule[reqId]);
-                idx += 1;
+                for (int64_t tokenIdx = 0; tokenIdx < draftTokensPerGen; ++tokenIdx)
+                {
+                    expandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 3]));
+                    expandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 3 + 1]));
+                    expandLoraRanks.push_back(loraRankModule[reqId]);
+                    idx += 1;
+                }
             }
             else
             {
-                int contextLen = (isRemoveInputPadding ? hostContextLengths[reqId] : seqLen);
+                int const contextLen = (isRemoveInputPadding ? hostContextLengths[reqId] : seqLen);
 
-                for (int contextId = 0; contextId < contextLen; contextId++)
+                for (int contextId = 0; contextId < contextLen; ++contextId)
                 {
                     expandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 3]));
                     expandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 3 + 1]));
@@ -127,6 +172,7 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
         {
             TLLM_CHECK_WITH_INFO(idx == numTokens,
                 fmtstr("LoraParams and input dims don't match, lora tokens %d input tokens %ld", idx, numTokens));
+            // TODO: idx 1 and numTokens 6 with eagle3one model
         }
     }
 
